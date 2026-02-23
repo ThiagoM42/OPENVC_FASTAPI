@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  opencv-api:
+    build: ./opencv-api
+    container_name: opencv-api
+    restart: always
+    networks:
+      - traefik
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.opencv.rule=Host(`opencv.infra-tms.cloud`)
+      - traefik.http.routers.opencv.entrypoints=websecure
+      - traefik.http.routers.opencv.tls.certresolver=myresolver
+      - traefik.http.services.opencv.loadbalancer.server.port=8000
+
+networks:
+  traefik:
+    external: true
