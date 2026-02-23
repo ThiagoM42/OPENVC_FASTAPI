@@ -33,174 +33,190 @@ async def process_image(file: UploadFile = File(...)):
     
     return JSONResponse(content=answers)
 
-def load_image(path: str) -> np.ndarray:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Imagem não encontrada: {path}")
-    img = cv2.imread(path)
-    if img is None:
-        raise ValueError(f"Não foi possível carregar: {path}")
+def _decode_image(source) -> np.ndarray:
+    """Aceita bytes (requisição HTTP) ou caminho de arquivo (str/Path)."""
+    if isinstance(source, (bytes, bytearray)):
+        arr = np.frombuffer(source, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            raise ValueError("Não foi possível decodificar os bytes da imagem.")
+    else:
+        if not os.path.exists(source):
+            raise FileNotFoundError(f"Imagem não encontrada: {source}")
+        img = cv2.imread(str(source))
+        if img is None:
+            raise ValueError(f"Não foi possível carregar: {source}")
     return img
 
 
-def preprocess(img: np.ndarray):
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 2
-    )
-    return gray, thresh
-
-
-def cluster_values(values, tolerance=30):
-    """Agrupa valores próximos e retorna os centros dos grupos."""
+def _cluster(values: list, tol: int) -> list:
+    """Agrupa valores numéricos próximos e retorna o centro de cada grupo."""
     sv = sorted(values)
     if not sv:
         return []
     groups = [[sv[0]]]
     for v in sv[1:]:
-        if v - groups[-1][-1] <= tolerance:
+        if v - groups[-1][-1] <= tol:
             groups[-1].append(v)
         else:
             groups.append([v])
     return [int(np.mean(g)) for g in groups]
 
 
-def fill_ratio(thresh: np.ndarray, cx: int, cy: int, r: int) -> float:
-    """Proporção de pixels escuros (preenchidos) dentro do círculo."""
+def _fill_ratio(thresh: np.ndarray, cx: int, cy: int, r: int) -> float:
+    """
+    Proporção de pixels escuros (preenchidos) dentro do círculo.
+    Usa 50% do raio para ignorar a borda do círculo e capturar só o interior.
+    """
+    inner = max(int(r * 0.50), 5)
     mask = np.zeros(thresh.shape, dtype=np.uint8)
-    inner = max(r - 5, 5)
     cv2.circle(mask, (cx, cy), inner, 255, -1)
     area = np.sum(mask > 0)
-    filled = np.sum((thresh > 0) & (mask > 0))
-    return filled / area if area else 0.0
+    return float(np.sum((thresh > 0) & (mask > 0))) / area if area else 0.0
 
 
-# ─────────────────────── core ───────────────────────
+# ──────────────────────────── core ────────────────────────────
 
-def read_gabarito(source, debug: bool = False,
-                  num_questions: int = 10) -> list:
+def read_gabarito(source, num_questions: int = None) -> list:
     """
-    Lê o gabarito e retorna lista de dicts com question_number e student_answer.
+    Lê um gabarito de múltipla escolha e retorna as respostas do aluno.
 
     Parâmetros
     ----------
-    source        : Caminho (str) OU bytes da imagem recebida via requisição
-    debug         : Se True, salva gabarito_debug.jpg com anotações visuais
-    num_questions : Quantidade de questões esperadas (padrão 10)
+    source        : bytes da imagem (requisição HTTP) ou str com caminho do arquivo.
+    num_questions : número de questões esperadas; se None, detecta automaticamente.
+
+    Retorna
+    -------
+    Lista de dicts: [{"question_number": int, "student_answer": str | None}, ...]
+    student_answer é None quando o círculo não está preenchido ou está fraco demais.
     """
-    FILL_THRESHOLD = 0.30   # fill ratio mínimo para considerar marcado (abaixo = null)
-    MIN_RADIUS     = 18     # raio mínimo dos círculos (px)
-    MAX_RADIUS     = 50     # raio máximo
 
-    if isinstance(source, (bytes, bytearray)):
-        arr = np.frombuffer(source, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            raise ValueError("Nao foi possivel decodificar os bytes da imagem.")
-    else:
-        img = load_image(source)
+    # ── Parâmetros de detecção ────────────────────────────────────────────
+    NUM_OPTIONS      = 5      # colunas de alternativas (A-E)
+    LEFT_MARGIN_FRAC = 0.30   # ignora círculos à esquerda de 30% da largura
+                              # (elimina ruídos dos números das questões na lateral)
+
+    # Um círculo é considerado MARCADO quando:
+    # 1. Seu fill ratio absoluto >= FILL_THRESHOLD  (elimina não-marcados mesmo com ratio alto)
+    # 2. Seu fill ratio >= RELATIVE_FACTOR × média dos demais da mesma linha
+    #    (exige que o marcado se destaque dos outros)
+    FILL_THRESHOLD  = 0.15
+    RELATIVE_FACTOR = 1.6
+
+    # ── 1. Carrega e pré-processa ─────────────────────────────────────────
+    img = _decode_image(source)
     h, w = img.shape[:2]
-    gray, thresh = preprocess(img)
 
-    # ── 1. Detecta todos os círculos ──────────────────────────────────────
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(
+        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV, 11, 2
+    )
+
+    # ── 2. Detecta círculos com parâmetros adaptativos à resolução ────────
+    min_r    = max(10, int(h * 0.010))   # ~1.0% da altura
+    max_r    = max(20, int(h * 0.032))   # ~3.2% da altura
+    min_dist = max(15, int(min_r * 1.2))
+
     raw = cv2.HoughCircles(
         gray, cv2.HOUGH_GRADIENT,
-        dp=1, minDist=25, param1=50, param2=28,
-        minRadius=MIN_RADIUS, maxRadius=MAX_RADIUS
+        dp=1, minDist=min_dist,
+        param1=50, param2=28,
+        minRadius=min_r, maxRadius=max_r
     )
     if raw is None:
-        print("⚠  Nenhum círculo detectado. Verifique a qualidade da imagem.")
-        return [{"question_number": i, "student_answer": None}
-                for i in range(1, num_questions + 1)]
+        raise RuntimeError(
+            "Nenhum círculo detectado. Verifique a qualidade e o formato da imagem."
+        )
 
-    all_circles = np.round(raw[0]).astype(int)
+    # Remove círculos da margem esquerda (ruídos dos números das questões)
+    x_min = int(w * LEFT_MARGIN_FRAC)
+    circles = [
+        (int(cx), int(cy), int(r))
+        for cx, cy, r in np.round(raw[0]).astype(int)
+        if cx > x_min
+    ]
 
-    # Descarta círculos muito à esquerda (números das questões escritos na lateral)
-    # As alternativas ficam na região direita da imagem (x > 30% da largura)
-    x_min_answer = w * 0.30
-    circles = [(int(cx), int(cy), int(r), fill_ratio(thresh, int(cx), int(cy), int(r)))
-               for cx, cy, r in all_circles if cx > x_min_answer]
+    # ── 3. Clusteriza linhas (Y) ──────────────────────────────────────────
+    tol_row = int(h * 0.020)
+    row_centers = _cluster([cy for cx, cy, r in circles], tol=tol_row)
 
-    # ── 2. Agrupa por linhas (Y) e colunas (X) ───────────────────────────
-    row_centers = cluster_values([c[1] for c in circles], tolerance=30)
-    col_centers_raw = cluster_values([c[0] for c in circles], tolerance=30)
+    # ── 4. Clusteriza colunas (X) e seleciona as NUM_OPTIONS mais populadas
+    col_centers_all = _cluster([cx for cx, cy, r in circles], tol=int(w * 0.020))
 
-    # Mantém apenas as 5 colunas mais populadas (as alternativas A-E)
-    if len(col_centers_raw) > 5:
-        col_pop = {}
-        for cx, cy, r, f in circles:
-            ci = min(range(len(col_centers_raw)),
-                     key=lambda i: abs(cx - col_centers_raw[i]))
-            col_pop[ci] = col_pop.get(ci, 0) + 1
-        top5 = sorted(sorted(col_pop, key=col_pop.get, reverse=True)[:5])
-        col_centers = [col_centers_raw[i] for i in top5]
+    col_pop: dict = {i: 0 for i in range(len(col_centers_all))}
+    for cx, cy, r in circles:
+        ci = min(range(len(col_centers_all)), key=lambda i: abs(cx - col_centers_all[i]))
+        col_pop[ci] += 1
+
+    top_cols = sorted(
+        sorted(col_pop, key=col_pop.get, reverse=True)[:NUM_OPTIONS]
+    )
+    col_centers = [col_centers_all[i] for i in top_cols]
+
+    # Tolerância de coluna = metade do espaçamento entre colunas
+    # Garante que círculos levemente deslocados ainda sejam capturados
+    if len(col_centers) > 1:
+        col_spacing = np.mean([
+            col_centers[i + 1] - col_centers[i]
+            for i in range(len(col_centers) - 1)
+        ])
     else:
-        col_centers = col_centers_raw
+        col_spacing = w * 0.10
+    tol_col = int(col_spacing * 0.50)
 
-    # ── 3. Mapeia cada círculo para (linha, coluna) ───────────────────────
-    grid: dict[tuple, float] = {}
-    for cx, cy, r, f in circles:
-        ri = min(range(len(row_centers)), key=lambda i: abs(cy - row_centers[i]))
-        ci = min(range(len(col_centers)), key=lambda i: abs(cx - col_centers[i]))
-        key = (ri, ci)
-        if key not in grid or f > grid[key]:
-            grid[key] = f
+    # ── 5. Descarta linhas de cabeçalho ───────────────────────────────────
+    # O cabeçalho (rótulos A B C D E) fica separado das questões por um gap
+    # bem maior que o espaçamento uniforme entre as questões.
+    if len(row_centers) > 1:
+        gaps = [row_centers[i + 1] - row_centers[i] for i in range(len(row_centers) - 1)]
+        median_gap = float(np.median(gaps))
+        header_indices = {i for i, g in enumerate(gaps) if g > median_gap * 1.5}
+    else:
+        header_indices = set()
 
-    # ── 4. Identifica linhas de questão (≥ 3 colunas detectadas) ─────────
-    row_pop = {}
-    for ri, ci in grid:
-        row_pop[ri] = row_pop.get(ri, 0) + 1
-    question_rows = sorted([r for r, cnt in row_pop.items() if cnt >= 3])
-    question_rows = question_rows[:num_questions]
+    question_rows = [ry for i, ry in enumerate(row_centers) if i not in header_indices]
+    if num_questions is not None:
+        question_rows = question_rows[:num_questions]
 
-    # ── 5. Para cada questão, determina a alternativa marcada ─────────────
+    # ── 6. Determina a resposta de cada questão ───────────────────────────
     options = ['A', 'B', 'C', 'D', 'E']
     results = []
 
-    for q_num, ri in enumerate(question_rows, start=1):
-        fills = [grid.get((ri, ci), 0.0) for ci in range(len(col_centers))]
+    for q_num, ry in enumerate(question_rows, start=1):
+        fills = []
+        for cx_col in col_centers:
+            # Candidatos na célula (linha ry, coluna cx_col)
+            candidates = [
+                (cx, cy, r) for cx, cy, r in circles
+                if abs(cy - ry) <= tol_row and abs(cx - cx_col) <= tol_col
+            ]
+            if candidates:
+                # Usa o círculo de MAIOR RAIO: as bolhas do gabarito são as maiores;
+                # detecções menores dentro delas são ruídos do HoughCircles.
+                cx, cy, r = max(candidates, key=lambda c: c[2])
+                f = _fill_ratio(thresh, cx, cy, r)
+            else:
+                f = 0.0
+            fills.append(f)
 
-        best_col = int(np.argmax(fills))
+        best_col  = int(np.argmax(fills))
         best_fill = fills[best_col]
+        others    = [f for i, f in enumerate(fills) if i != best_col]
+        avg_others = float(np.mean(others)) if others else 0.0
 
-        # Média dos outros círculos da mesma linha
-        others = [f for i, f in enumerate(fills) if i != best_col]
-        avg_others = np.mean(others) if others else 0.0
+        # Círculo marcado: fill absoluto suficiente E destaque relativo
+        marked = (
+            best_fill >= FILL_THRESHOLD
+            and (avg_others == 0 or best_fill >= avg_others * RELATIVE_FACTOR)
+            and best_col < len(options)
+        )
 
-        # Considera marcado apenas se:
-        # 1. fill absoluto >= FILL_THRESHOLD
-        # 2. destaca-se pelo menos 30% acima da média dos demais
-        marked = (best_fill >= FILL_THRESHOLD and
-                  best_fill >= avg_others * 1.3 and
-                  best_col < len(options))
-
-        answer = options[best_col] if marked else None
-        results.append({"question_number": q_num, "student_answer": answer})
-
-    # Completa até num_questions
-    while len(results) < num_questions:
-        results.append({"question_number": len(results) + 1, "student_answer": None})
-
-    # ── 6. Debug: imagem anotada ──────────────────────────────────────────
-    if debug:
-        dbg = img.copy()
-        for cx, cy, r, f in circles:
-            marked = f >= FILL_THRESHOLD
-            color = (0, 200, 0) if marked else (180, 180, 180)
-            cv2.circle(dbg, (cx, cy), r, color, -1 if marked else 2)
-            cv2.putText(dbg, f"{f:.2f}", (cx - 18, cy + 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.4,
-                        (0, 0, 0) if marked else (80, 80, 80), 1)
-        for ry in row_centers:
-            cv2.line(dbg, (0, ry), (w, ry), (255, 100, 0), 1)
-        for cx_c in col_centers:
-            cv2.line(dbg, (cx_c, 0), (cx_c, h), (0, 100, 255), 1)
-        if isinstance(source, str):
-            debug_out = os.path.splitext(source)[0] + '_debug.jpg'
-        else:
-            debug_out = 'gabarito_debug.jpg'
-        cv2.imwrite(debug_out, dbg)
-        print(f"✓ Debug salvo em: {debug_out}")
+        results.append({
+            "question_number": q_num,
+            "student_answer": options[best_col] if marked else None
+        })
 
     return results
