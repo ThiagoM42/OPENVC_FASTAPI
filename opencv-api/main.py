@@ -179,6 +179,7 @@ def read_gabarito(source, num_questions: int = None) -> list:
         best_fill = fills[best_col]
 
         # Marcado: presença de azul acima do mínimo E única célula com azul na linha
+        #
         marked = best_fill >= BLUE_MIN and best_col < len(options)
 
         results.append({
