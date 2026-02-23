@@ -2,36 +2,12 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 import numpy as np
 import cv2
-import io
 import os
 
 app = FastAPI()
 
-@app.get("/")
-def health():
-    return {"status": "OpenCV API running 🚀"}
 
-@app.post("/process")
-async def process_image(file: UploadFile = File(...)):
-    contents = await file.read()
-    try:
-        answers = read_gabarito(contents)
-
-        
-        
-
-        # out_json = "gabarito_resultado.json"
-        # with open(out_json, "w", encoding="utf-8") as f:
-        #     json.dump(answers, f, indent=2, ensure_ascii=False)
-        # print(f"\n✓ Resultado salvo em: {out_json}")
-
-    except Exception as e:
-        print(f"Erro: {e}")
-        return {"error": str(e)}
-        
-    
-    
-    return JSONResponse(content=answers)
+# ──────────────────────────── helpers ────────────────────────────
 
 def _decode_image(source) -> np.ndarray:
     """Aceita bytes (requisição HTTP) ou caminho de arquivo (str/Path)."""
@@ -67,7 +43,6 @@ def _blue_fill(hsv: np.ndarray, cx: int, cy: int, r: int) -> float:
     """
     Proporção de pixels com cor azul escuro (tinta de caneta) dentro do círculo.
     Usa 50% do raio para ignorar a borda e focar no interior da bolha.
-    Funciona independente da intensidade do preenchimento.
     """
     inner = max(int(r * 0.50), 5)
     mask_circle = np.zeros(hsv.shape[:2], dtype=np.uint8)
@@ -76,7 +51,6 @@ def _blue_fill(hsv: np.ndarray, cx: int, cy: int, r: int) -> float:
     if area == 0:
         return 0.0
 
-    # Faixa de cor: azul escuro a roxo escuro (tinta de caneta esferográfica)
     lower = np.array([85, 40, 20])
     upper = np.array([165, 255, 200])
     mask_blue = cv2.inRange(hsv, lower, upper)
@@ -84,8 +58,6 @@ def _blue_fill(hsv: np.ndarray, cx: int, cy: int, r: int) -> float:
     filled = float(np.sum((mask_blue > 0) & (mask_circle > 0)))
     return filled / area
 
-
-# ──────────────────────────── core ────────────────────────────
 
 def read_gabarito(source, num_questions: int = None) -> list:
     """
@@ -99,23 +71,17 @@ def read_gabarito(source, num_questions: int = None) -> list:
     Retorna
     -------
     Lista de dicts: [{"question_number": int, "student_answer": str | None}, ...]
-    student_answer é None quando a célula não apresenta tinta azul de caneta.
     """
+    NUM_OPTIONS      = 5
+    LEFT_MARGIN_FRAC = 0.30
+    BLUE_MIN         = 0.05
 
-    NUM_OPTIONS      = 5      # alternativas: A B C D E
-    LEFT_MARGIN_FRAC = 0.30   # ignora círculos à esquerda de 30% da largura
-    BLUE_MIN         = 0.05   # mínimo de fill azul para considerar marcado (5%)
-
-    # ── 1. Carrega a imagem ───────────────────────────────────────────────
     img = _decode_image(source)
     h, w = img.shape[:2]
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    # ── 2. Detecta círculos para construir o grid ─────────────────────────
-    # param2=50: exige acumuladores fortes -> pega apenas bolhas bem definidas
-    # Isso é suficiente para estabelecer linhas e colunas do grid.
     min_r    = max(10, int(h * 0.010))
     max_r    = max(20, int(h * 0.032))
     min_dist = max(15, int(min_r * 1.2))
@@ -127,11 +93,8 @@ def read_gabarito(source, num_questions: int = None) -> list:
         minRadius=min_r, maxRadius=max_r
     )
     if raw is None:
-        raise RuntimeError(
-            "Nenhum círculo detectado. Verifique a qualidade e o formato da imagem."
-        )
+        raise RuntimeError("Nenhum círculo detectado. Verifique a qualidade e o formato da imagem.")
 
-    # Remove ruídos da margem esquerda (números das questões)
     x_min   = int(w * LEFT_MARGIN_FRAC)
     circles = [
         (int(cx), int(cy), int(r))
@@ -139,24 +102,19 @@ def read_gabarito(source, num_questions: int = None) -> list:
         if cx > x_min
     ]
 
-    # ── 3. Clusteriza para obter centros de linhas e colunas ──────────────
-    tol_row = int(h * 0.020)
+    tol_row         = int(h * 0.020)
     row_centers     = _cluster([cy for cx, cy, r in circles], tol=tol_row)
     col_centers_all = _cluster([cx for cx, cy, r in circles], tol=int(w * 0.020))
 
-    # Seleciona as NUM_OPTIONS colunas mais frequentes
     col_pop: dict = {i: 0 for i in range(len(col_centers_all))}
     for cx, cy, r in circles:
         ci = min(range(len(col_centers_all)), key=lambda i: abs(cx - col_centers_all[i]))
         col_pop[ci] += 1
-    top_cols   = sorted(sorted(col_pop, key=col_pop.get, reverse=True)[:NUM_OPTIONS])
+    top_cols    = sorted(sorted(col_pop, key=col_pop.get, reverse=True)[:NUM_OPTIONS])
     col_centers = [col_centers_all[i] for i in top_cols]
 
-    # Raio médio das bolhas detectadas
     avg_r = int(np.mean([r for cx, cy, r in circles])) if circles else int(h * 0.020)
 
-    # ── 4. Remove linhas de cabeçalho ─────────────────────────────────────
-    # Cabeçalho tem um gap vertical muito maior que o espaçamento entre questões
     if len(row_centers) > 1:
         gaps       = [row_centers[i + 1] - row_centers[i] for i in range(len(row_centers) - 1)]
         median_gap = float(np.median(gaps))
@@ -168,19 +126,14 @@ def read_gabarito(source, num_questions: int = None) -> list:
     if num_questions is not None:
         question_rows = question_rows[:num_questions]
 
-    # ── 5. Para cada célula do grid, mede presença de tinta azul ─────────
     options = ['A', 'B', 'C', 'D', 'E']
     results = []
 
     for q_num, ry in enumerate(question_rows, start=1):
-        fills = [_blue_fill(hsv, cx_col, ry, avg_r) for cx_col in col_centers]
-
+        fills     = [_blue_fill(hsv, cx_col, ry, avg_r) for cx_col in col_centers]
         best_col  = int(np.argmax(fills))
         best_fill = fills[best_col]
-
-        # Marcado: presença de azul acima do mínimo E única célula com azul na linha
-        #
-        marked = best_fill >= BLUE_MIN and best_col < len(options)
+        marked    = best_fill >= BLUE_MIN and best_col < len(options)
 
         results.append({
             "question_number": q_num,
@@ -188,3 +141,22 @@ def read_gabarito(source, num_questions: int = None) -> list:
         })
 
     return results
+
+
+# ──────────────────────────── endpoints ────────────────────────────
+
+@app.get("/")
+def health():
+    return {"status": "OpenCV API running 🚀"}
+
+
+@app.post("/process")
+async def process_image(file: UploadFile = File(...)):
+    contents = await file.read()
+    try:
+        answers = read_gabarito(contents)
+    except Exception as e:
+        print(f"Erro: {e}")
+        return {"error": str(e)}
+
+    return JSONResponse(content=answers)
