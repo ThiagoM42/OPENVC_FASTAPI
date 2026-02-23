@@ -63,16 +63,26 @@ def _cluster(values: list, tol: int) -> list:
     return [int(np.mean(g)) for g in groups]
 
 
-def _fill_ratio(thresh: np.ndarray, cx: int, cy: int, r: int) -> float:
+def _blue_fill(hsv: np.ndarray, cx: int, cy: int, r: int) -> float:
     """
-    Proporção de pixels escuros (preenchidos) dentro do círculo.
-    Usa 50% do raio para ignorar a borda do círculo e capturar só o interior.
+    Proporção de pixels com cor azul escuro (tinta de caneta) dentro do círculo.
+    Usa 50% do raio para ignorar a borda e focar no interior da bolha.
+    Funciona independente da intensidade do preenchimento.
     """
     inner = max(int(r * 0.50), 5)
-    mask = np.zeros(thresh.shape, dtype=np.uint8)
-    cv2.circle(mask, (cx, cy), inner, 255, -1)
-    area = np.sum(mask > 0)
-    return float(np.sum((thresh > 0) & (mask > 0))) / area if area else 0.0
+    mask_circle = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    cv2.circle(mask_circle, (int(cx), int(cy)), inner, 255, -1)
+    area = float(np.sum(mask_circle > 0))
+    if area == 0:
+        return 0.0
+
+    # Faixa de cor: azul escuro a roxo escuro (tinta de caneta esferográfica)
+    lower = np.array([85, 40, 20])
+    upper = np.array([165, 255, 200])
+    mask_blue = cv2.inRange(hsv, lower, upper)
+
+    filled = float(np.sum((mask_blue > 0) & (mask_circle > 0)))
+    return filled / area
 
 
 # ──────────────────────────── core ────────────────────────────
@@ -89,41 +99,31 @@ def read_gabarito(source, num_questions: int = None) -> list:
     Retorna
     -------
     Lista de dicts: [{"question_number": int, "student_answer": str | None}, ...]
-    student_answer é None quando o círculo não está preenchido ou está fraco demais.
+    student_answer é None quando a célula não apresenta tinta azul de caneta.
     """
 
-    # ── Parâmetros de detecção ────────────────────────────────────────────
-    NUM_OPTIONS      = 5      # colunas de alternativas (A-E)
+    NUM_OPTIONS      = 5      # alternativas: A B C D E
     LEFT_MARGIN_FRAC = 0.30   # ignora círculos à esquerda de 30% da largura
-                              # (elimina ruídos dos números das questões na lateral)
+    BLUE_MIN         = 0.05   # mínimo de fill azul para considerar marcado (5%)
 
-    # Um círculo é considerado MARCADO quando:
-    # 1. Seu fill ratio absoluto >= FILL_THRESHOLD  (elimina não-marcados mesmo com ratio alto)
-    # 2. Seu fill ratio >= RELATIVE_FACTOR × média dos demais da mesma linha
-    #    (exige que o marcado se destaque dos outros)
-    FILL_THRESHOLD  = 0.15
-    RELATIVE_FACTOR = 1.6
-
-    # ── 1. Carrega e pré-processa ─────────────────────────────────────────
+    # ── 1. Carrega a imagem ───────────────────────────────────────────────
     img = _decode_image(source)
     h, w = img.shape[:2]
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    thresh = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 11, 2
-    )
+    hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
 
-    # ── 2. Detecta círculos com parâmetros adaptativos à resolução ────────
-    min_r    = max(10, int(h * 0.010))   # ~1.0% da altura
-    max_r    = max(20, int(h * 0.032))   # ~3.2% da altura
+    # ── 2. Detecta círculos para construir o grid ─────────────────────────
+    # param2=50: exige acumuladores fortes -> pega apenas bolhas bem definidas
+    # Isso é suficiente para estabelecer linhas e colunas do grid.
+    min_r    = max(10, int(h * 0.010))
+    max_r    = max(20, int(h * 0.032))
     min_dist = max(15, int(min_r * 1.2))
 
     raw = cv2.HoughCircles(
         gray, cv2.HOUGH_GRADIENT,
         dp=1, minDist=min_dist,
-        param1=50, param2=28,
+        param1=50, param2=50,
         minRadius=min_r, maxRadius=max_r
     )
     if raw is None:
@@ -131,88 +131,55 @@ def read_gabarito(source, num_questions: int = None) -> list:
             "Nenhum círculo detectado. Verifique a qualidade e o formato da imagem."
         )
 
-    # Remove círculos da margem esquerda (ruídos dos números das questões)
-    x_min = int(w * LEFT_MARGIN_FRAC)
+    # Remove ruídos da margem esquerda (números das questões)
+    x_min   = int(w * LEFT_MARGIN_FRAC)
     circles = [
         (int(cx), int(cy), int(r))
         for cx, cy, r in np.round(raw[0]).astype(int)
         if cx > x_min
     ]
 
-    # ── 3. Clusteriza linhas (Y) ──────────────────────────────────────────
+    # ── 3. Clusteriza para obter centros de linhas e colunas ──────────────
     tol_row = int(h * 0.020)
-    row_centers = _cluster([cy for cx, cy, r in circles], tol=tol_row)
-
-    # ── 4. Clusteriza colunas (X) e seleciona as NUM_OPTIONS mais populadas
+    row_centers     = _cluster([cy for cx, cy, r in circles], tol=tol_row)
     col_centers_all = _cluster([cx for cx, cy, r in circles], tol=int(w * 0.020))
 
+    # Seleciona as NUM_OPTIONS colunas mais frequentes
     col_pop: dict = {i: 0 for i in range(len(col_centers_all))}
     for cx, cy, r in circles:
         ci = min(range(len(col_centers_all)), key=lambda i: abs(cx - col_centers_all[i]))
         col_pop[ci] += 1
-
-    top_cols = sorted(
-        sorted(col_pop, key=col_pop.get, reverse=True)[:NUM_OPTIONS]
-    )
+    top_cols   = sorted(sorted(col_pop, key=col_pop.get, reverse=True)[:NUM_OPTIONS])
     col_centers = [col_centers_all[i] for i in top_cols]
 
-    # Tolerância de coluna = metade do espaçamento entre colunas
-    # Garante que círculos levemente deslocados ainda sejam capturados
-    if len(col_centers) > 1:
-        col_spacing = np.mean([
-            col_centers[i + 1] - col_centers[i]
-            for i in range(len(col_centers) - 1)
-        ])
-    else:
-        col_spacing = w * 0.10
-    tol_col = int(col_spacing * 0.50)
+    # Raio médio das bolhas detectadas
+    avg_r = int(np.mean([r for cx, cy, r in circles])) if circles else int(h * 0.020)
 
-    # ── 5. Descarta linhas de cabeçalho ───────────────────────────────────
-    # O cabeçalho (rótulos A B C D E) fica separado das questões por um gap
-    # bem maior que o espaçamento uniforme entre as questões.
+    # ── 4. Remove linhas de cabeçalho ─────────────────────────────────────
+    # Cabeçalho tem um gap vertical muito maior que o espaçamento entre questões
     if len(row_centers) > 1:
-        gaps = [row_centers[i + 1] - row_centers[i] for i in range(len(row_centers) - 1)]
+        gaps       = [row_centers[i + 1] - row_centers[i] for i in range(len(row_centers) - 1)]
         median_gap = float(np.median(gaps))
-        header_indices = {i for i, g in enumerate(gaps) if g > median_gap * 1.5}
+        header_idx = {i for i, g in enumerate(gaps) if g > median_gap * 1.5}
     else:
-        header_indices = set()
+        header_idx = set()
 
-    question_rows = [ry for i, ry in enumerate(row_centers) if i not in header_indices]
+    question_rows = [ry for i, ry in enumerate(row_centers) if i not in header_idx]
     if num_questions is not None:
         question_rows = question_rows[:num_questions]
 
-    # ── 6. Determina a resposta de cada questão ───────────────────────────
+    # ── 5. Para cada célula do grid, mede presença de tinta azul ─────────
     options = ['A', 'B', 'C', 'D', 'E']
     results = []
 
     for q_num, ry in enumerate(question_rows, start=1):
-        fills = []
-        for cx_col in col_centers:
-            # Candidatos na célula (linha ry, coluna cx_col)
-            candidates = [
-                (cx, cy, r) for cx, cy, r in circles
-                if abs(cy - ry) <= tol_row and abs(cx - cx_col) <= tol_col
-            ]
-            if candidates:
-                # Usa o círculo de MAIOR RAIO: as bolhas do gabarito são as maiores;
-                # detecções menores dentro delas são ruídos do HoughCircles.
-                cx, cy, r = max(candidates, key=lambda c: c[2])
-                f = _fill_ratio(thresh, cx, cy, r)
-            else:
-                f = 0.0
-            fills.append(f)
+        fills = [_blue_fill(hsv, cx_col, ry, avg_r) for cx_col in col_centers]
 
         best_col  = int(np.argmax(fills))
         best_fill = fills[best_col]
-        others    = [f for i, f in enumerate(fills) if i != best_col]
-        avg_others = float(np.mean(others)) if others else 0.0
 
-        # Círculo marcado: fill absoluto suficiente E destaque relativo
-        marked = (
-            best_fill >= FILL_THRESHOLD
-            and (avg_others == 0 or best_fill >= avg_others * RELATIVE_FACTOR)
-            and best_col < len(options)
-        )
+        # Marcado: presença de azul acima do mínimo E única célula com azul na linha
+        marked = best_fill >= BLUE_MIN and best_col < len(options)
 
         results.append({
             "question_number": q_num,
