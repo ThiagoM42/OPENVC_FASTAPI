@@ -49,17 +49,17 @@ API para leitura automática de gabaritos de múltipla escolha via visão comput
 ```json
 {
   "total": 10,
-  "answers": {
-    "1": "B",
-    "2": "C",
-    "3": "D",
-    "4": null,
-    "5": "E"
-  }
+  "answers": [
+    {"question_number": 1, "student_answer": "B"},
+    {"question_number": 2, "student_answer": "C"},
+    {"question_number": 3, "student_answer": null},
+    {"question_number": 4, "student_answer": "D"},
+    {"question_number": 5, "student_answer": "E"}
+  ]
 }
 ```
 
-> Questões sem nenhuma bolha marcada retornam `null`.
+> Questões sem nenhuma bolha marcada retornam `student_answer: null`.
 
 ### Limites
 
@@ -242,7 +242,13 @@ def processar_gabarito(img: np.ndarray, num_questoes: int, n_alternativas: int) 
         else:
             answers[str(i + 1)] = LETRAS[melhor_col] if melhor_col < len(LETRAS) else None
 
-    return {"total": len(answers), "answers": answers}
+    return {
+        "total": len(answers),
+        "answers": [
+            {"question_number": int(q), "student_answer": a}
+            for q, a in answers.items()
+        ],
+    }
 
 
 # ─────────────────────────────────────────────
@@ -277,7 +283,13 @@ def health():
                 "application/json": {
                     "example": {
                         "total": 5,
-                        "answers": {"1": "B", "2": "C", "3": "D", "4": None, "5": "E"},
+                        "answers": [
+                        {"question_number": 1, "student_answer": "B"},
+                        {"question_number": 2, "student_answer": "C"},
+                        {"question_number": 3, "student_answer": None},
+                        {"question_number": 4, "student_answer": "D"},
+                        {"question_number": 5, "student_answer": "E"},
+                    ],
                     }
                 }
             },
