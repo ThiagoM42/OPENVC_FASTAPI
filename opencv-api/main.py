@@ -318,15 +318,35 @@ def _infer_option_columns(circles: list, n: int = 5) -> list[int]:
 def _infer_question_rows(circles: list) -> list[int]:
     """
     Retorna os Y centrais das linhas de questões.
-    Filtra cabeçalho e ruído via consistência do espaçamento.
+
+    Estratégia em dois passos:
+      1. Remove linhas de CABEÇALHO iniciais — identificadas por gaps
+         menores que 85% da mediana (letras A-E ficam compactadas
+         acima das questões).
+      2. Da sequência restante, mantém apenas a subsequência com
+         espaçamento mais regular (elimina ruído no final).
     """
     ys_all     = _cluster_1d([cy for cx, cy, r, d in circles], gap=18)
     candidates = sorted(yc for yc, cnt in ys_all if cnt >= 3)
     if len(candidates) <= 3:
         return candidates
 
-    spacings  = [candidates[i + 1] - candidates[i]
-                 for i in range(len(candidates) - 1)]
+    spacings  = [candidates[i + 1] - candidates[i] for i in range(len(candidates) - 1)]
+    median_sp = float(np.median(spacings))
+
+    # ── Passo 1: pula cabeçalho (gaps iniciais compactados) ──────────────
+    start = 0
+    for i, sp in enumerate(spacings):
+        if sp >= median_sp * 0.85:
+            start = i
+            break
+    candidates = candidates[start:]
+
+    if len(candidates) <= 1:
+        return candidates
+
+    # ── Passo 2: sequência regular mais longa ─────────────────────────────
+    spacings  = [candidates[i + 1] - candidates[i] for i in range(len(candidates) - 1)]
     median_sp = float(np.median(spacings))
     tol       = median_sp * 0.40
 
