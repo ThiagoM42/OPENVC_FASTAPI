@@ -5,7 +5,16 @@ from fastapi.openapi.utils import get_openapi
 import cv2
 import numpy as np
 from sklearn.cluster import KMeans
+import asyncio
+import concurrent.futures
+from functools import partial
 
+# ─────────────────────────────────────────────
+# CONFIGURAÇÕES
+# ─────────────────────────────────────────────
+
+PROCESSING_TIMEOUT_SECONDS = 20   # tempo máximo de processamento por requisição
+MAX_IMAGE_SIZE_MB = 20             # tamanho máximo do arquivo enviado
 
 # ─────────────────────────────────────────────
 # CONFIGURAÇÃO E DOCS
@@ -26,6 +35,7 @@ API para leitura automática de gabaritos de múltipla escolha via visão comput
 ### Requisitos da imagem
 
 - Formato: **JPG ou PNG**
+- Tamanho máximo: **20 MB**
 - A folha deve estar **visível e enquadrada** na foto
 - Bolhas preenchidas com **caneta azul ou preta**
 - Iluminação razoável, sem sombras fortes sobre as bolhas
@@ -35,7 +45,7 @@ API para leitura automática de gabaritos de múltipla escolha via visão comput
 ```json
 {
   "total": 10,
-  "questoes": {
+  "answers": {
     "1": "B",
     "2": "C",
     "3": "D",
@@ -45,10 +55,21 @@ API para leitura automática de gabaritos de múltipla escolha via visão comput
 }
 ```
 
+### Limites
+
+| Recurso | Limite |
+|---------|--------|
+| Tamanho máximo da imagem | 20 MB |
+| Tempo máximo de processamento | 20 segundos |
+| Questões por gabarito | 1 – 100 |
+| Alternativas por questão | 2 – 5 |
+
 ### Códigos de erro
 
 | Código | Motivo |
 |--------|--------|
+| `408`  | Tempo de processamento excedido (> 20s) |
+| `413`  | Imagem maior que 20 MB |
 | `422`  | Imagem inválida, formato não suportado ou bolhas não detectadas |
 | `500`  | Erro interno de processamento |
 """
@@ -71,7 +92,7 @@ app = FastAPI(
     openapi_tags=tags_metadata,
     contact={"name": "Suporte", "email": "suporte@exemplo.com"},
     license_info={"name": "MIT"},
-    docs_url=None,   # desativa padrão — customizamos abaixo
+    docs_url=None,
     redoc_url=None,
 )
 
@@ -173,13 +194,13 @@ def processar_gabarito(img: np.ndarray, num_questoes: int, n_alternativas: int) 
         dados.setdefault(ri, {})
         dados[ri][ci] = max(dados[ri].get(ci, 0), d)
 
-    questoes: dict[str, str] = {}
+    answers: dict[str, str] = {}
     for ri in sorted(dados.keys()):
         opcoes = dados[ri]
         melhor = max(opcoes, key=opcoes.get)
-        questoes[str(ri + 1)] = LETRAS[melhor] if melhor < len(LETRAS) else "?"
+        answers[str(ri + 1)] = LETRAS[melhor] if melhor < len(LETRAS) else "?"
 
-    return {"total": len(questoes), "questoes": questoes}
+    return {"total": len(answers), "answers": answers}
 
 
 # ─────────────────────────────────────────────
@@ -214,11 +235,13 @@ def health():
                 "application/json": {
                     "example": {
                         "total": 5,
-                        "questoes": {"1": "B", "2": "C", "3": "D", "4": "A", "5": "E"},
+                        "answers": {"1": "B", "2": "C", "3": "D", "4": "A", "5": "E"},
                     }
                 }
             },
         },
+        408: {"description": f"Timeout — processamento excedeu {PROCESSING_TIMEOUT_SECONDS}s"},
+        413: {"description": f"Imagem maior que {MAX_IMAGE_SIZE_MB} MB"},
         422: {"description": "Imagem inválida ou bolhas não detectadas"},
         500: {"description": "Erro interno de processamento"},
     },
@@ -231,25 +254,51 @@ async def ler_gabarito(
     """
     Processa a imagem de um gabarito e retorna as respostas detectadas.
 
-    - **file** — foto JPG ou PNG do gabarito preenchido com caneta azul ou preta
+    - **file** — foto JPG ou PNG do gabarito (máx. 10 MB)
     - **num_questoes** — quantidade de questões no gabarito (padrão: 10)
     - **num_alternativas** — quantidade de alternativas por questão (padrão: 5 = A–E)
+
+    Tempo máximo de processamento: **10 segundos**.
     """
+    # Validar content-type
     if file.content_type not in ("image/jpeg", "image/png", "image/jpg"):
         raise HTTPException(
             status_code=422,
             detail="Formato inválido. Envie uma imagem JPG ou PNG.",
         )
 
+    # Ler bytes e validar tamanho
     contents = await file.read()
+    size_mb = len(contents) / (1024 * 1024)
+    if size_mb > MAX_IMAGE_SIZE_MB:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Imagem muito grande ({size_mb:.1f} MB). Limite: {MAX_IMAGE_SIZE_MB} MB.",
+        )
+
+    # Decodificar imagem
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
     if img is None:
         raise HTTPException(status_code=422, detail="Não foi possível decodificar a imagem.")
 
+    # Executar processamento em thread separada com timeout
+    # (OpenCV/KMeans são bloqueantes — rodar no executor evita travar o event loop)
+    loop = asyncio.get_event_loop()
+    fn = partial(processar_gabarito, img, num_questoes, num_alternativas)
+
     try:
-        resultado = processar_gabarito(img, num_questoes, num_alternativas)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            resultado = await asyncio.wait_for(
+                loop.run_in_executor(executor, fn),
+                timeout=PROCESSING_TIMEOUT_SECONDS,
+            )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=408,
+            detail=f"Tempo de processamento excedido ({PROCESSING_TIMEOUT_SECONDS}s). "
+                   "Tente com uma imagem menor ou de melhor qualidade.",
+        )
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
@@ -270,12 +319,12 @@ def swagger_ui() -> HTMLResponse:
         title="Leitor de Gabarito — Swagger UI",
         swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
         swagger_ui_parameters={
-            "defaultModelsExpandDepth": -1,    # esconde schemas por padrão
-            "docExpansion": "list",             # endpoints em lista aberta
-            "filter": True,                     # campo de busca no topo
-            "tryItOutEnabled": True,            # Try it out já ativo
+            "defaultModelsExpandDepth": -1,
+            "docExpansion": "list",
+            "filter": True,
+            "tryItOutEnabled": True,
             "persistAuthorization": True,
-            "displayRequestDuration": True,     # mostra tempo de resposta
+            "displayRequestDuration": True,
         },
     )
 
