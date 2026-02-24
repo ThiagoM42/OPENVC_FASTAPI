@@ -15,6 +15,8 @@ from functools import partial
 
 PROCESSING_TIMEOUT_SECONDS = 10
 MAX_IMAGE_SIZE_MB = 10
+TARGET_WIDTH = 1201
+TARGET_HEIGHT = 1600
 
 # ─────────────────────────────────────────────
 # DOCS
@@ -305,6 +307,9 @@ async def ler_gabarito(
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(status_code=422, detail="Não foi possível decodificar a imagem.")
+
+    # Padroniza resolução → processamento consistente independente da câmera/dispositivo
+    img = cv2.resize(img, (TARGET_WIDTH, TARGET_HEIGHT), interpolation=cv2.INTER_AREA)
 
     # Executar em thread separada com timeout (OpenCV/KMeans são bloqueantes)
     loop = asyncio.get_event_loop()
