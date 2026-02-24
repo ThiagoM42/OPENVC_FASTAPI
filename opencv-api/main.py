@@ -13,11 +13,11 @@ from functools import partial
 # CONFIGURAÇÕES
 # ─────────────────────────────────────────────
 
-PROCESSING_TIMEOUT_SECONDS = 20   # tempo máximo de processamento por requisição
-MAX_IMAGE_SIZE_MB = 20             # tamanho máximo do arquivo enviado
+PROCESSING_TIMEOUT_SECONDS = 10
+MAX_IMAGE_SIZE_MB = 10
 
 # ─────────────────────────────────────────────
-# CONFIGURAÇÃO E DOCS
+# DOCS
 # ─────────────────────────────────────────────
 
 description = """
@@ -29,13 +29,15 @@ API para leitura automática de gabaritos de múltipla escolha via visão comput
 
 1. **Envie** uma foto do gabarito preenchido (JPG ou PNG)
 2. A API **detecta** automaticamente as bolhas usando OpenCV + HoughCircles
-3. O algoritmo **clusteriza** as bolhas em linhas (questões) e colunas (A–E) via KMeans
-4. Retorna um **JSON** com a resposta de cada questão
+3. As colunas A–E são fixadas via **KMeans** no eixo X
+4. As linhas (questões) são agrupadas por **proximidade de Y** com tolerância dinâmica
+5. Círculos espúrios são removidos mantendo **1 círculo por coluna por linha**
+6. Retorna um **JSON** com a resposta de cada questão
 
 ### Requisitos da imagem
 
 - Formato: **JPG ou PNG**
-- Tamanho máximo: **20 MB**
+- Tamanho máximo: **10 MB**
 - A folha deve estar **visível e enquadrada** na foto
 - Bolhas preenchidas com **caneta azul ou preta**
 - Iluminação razoável, sem sombras fortes sobre as bolhas
@@ -59,8 +61,8 @@ API para leitura automática de gabaritos de múltipla escolha via visão comput
 
 | Recurso | Limite |
 |---------|--------|
-| Tamanho máximo da imagem | 20 MB |
-| Tempo máximo de processamento | 20 segundos |
+| Tamanho máximo da imagem | 10 MB |
+| Tempo máximo de processamento | 10 segundos |
 | Questões por gabarito | 1 – 100 |
 | Alternativas por questão | 2 – 5 |
 
@@ -68,21 +70,15 @@ API para leitura automática de gabaritos de múltipla escolha via visão comput
 
 | Código | Motivo |
 |--------|--------|
-| `408`  | Tempo de processamento excedido (> 20s) |
-| `413`  | Imagem maior que 20 MB |
+| `408`  | Tempo de processamento excedido (> 10s) |
+| `413`  | Imagem maior que 10 MB |
 | `422`  | Imagem inválida, formato não suportado ou bolhas não detectadas |
 | `500`  | Erro interno de processamento |
 """
 
 tags_metadata = [
-    {
-        "name": "Health",
-        "description": "Endpoints para verificar se a API está no ar.",
-    },
-    {
-        "name": "Gabarito",
-        "description": "Leitura e processamento de gabaritos preenchidos.",
-    },
+    {"name": "Health",   "description": "Endpoints para verificar se a API está no ar."},
+    {"name": "Gabarito", "description": "Leitura e processamento de gabaritos preenchidos."},
 ]
 
 app = FastAPI(
@@ -148,57 +144,83 @@ def densidade_bolha(mask: np.ndarray, cx: int, cy: int, r: int) -> float:
 
 
 def processar_gabarito(img: np.ndarray, num_questoes: int, n_alternativas: int) -> dict:
-    """Pipeline completo: recorte → detecção → clusterização → leitura."""
+    """
+    Pipeline completo:
+      1. Recorta a tabela
+      2. Detecta todos os círculos com HoughCircles
+      3. Fixa as N colunas (A–E) via KMeans no eixo X
+      4. Agrupa linhas por proximidade de Y (tolerância dinâmica)
+      5. Remove círculos espúrios: mantém 1 por coluna por linha (maior raio)
+      6. Calcula densidade de tinta azul e retorna a letra marcada
+    """
     tabela = recortar_tabela(img)
 
     circles = detectar_circulos(tabela)
     if circles is None:
         raise ValueError("Nenhuma bolha detectada na imagem.")
 
-    # Remove coluna de números das questões (esquerda ~25%) e header (topo)
+    # Filtrar coluna de números das questões (esquerda ~25%) e cabeçalho (topo)
     x_min_resp = int(tabela.shape[1] * 0.25)
     body = [c for c in circles if c[1] > 150 and c[0] > x_min_resp]
 
     if len(body) < n_alternativas:
         raise ValueError(f"Bolhas insuficientes detectadas: {len(body)}")
 
-    # Clusterizar colunas A–E
-    xs = np.array([c[0] for c in body]).reshape(-1, 1)
+    # ── Passo 1: fixar colunas via KMeans no eixo X ──
+    # Usar todos os círculos garante amostras suficientes por coluna → resultado estável
+    xs_all = np.array([c[0] for c in body]).reshape(-1, 1)
     col_centers = sorted(
-        KMeans(n_clusters=n_alternativas, random_state=0, n_init=10)
-        .fit(xs)
+        KMeans(n_clusters=n_alternativas, random_state=0, n_init=20)
+        .fit(xs_all)
         .cluster_centers_.flatten()
     )
 
-    # Clusterizar linhas (questões)
-    n_rows = num_questoes or (len(body) // n_alternativas)
-    ys = np.array([c[1] for c in body]).reshape(-1, 1)
-    row_centers = sorted(
-        KMeans(n_clusters=n_rows, random_state=0, n_init=10)
-        .fit(ys)
-        .cluster_centers_.flatten()
-    )
+    def col_idx(cx: int) -> int:
+        return int(np.argmin([abs(cx - c) for c in col_centers]))
 
-    def nearest(val, centers):
-        return int(np.argmin([abs(val - c) for c in centers]))
+    # ── Passo 2: agrupar linhas por proximidade de Y ──
+    body_sorted = sorted(body, key=lambda c: c[1])
+    TOLERANCIA_Y = 55
 
+    grupos: list[list] = []
+    grupo_atual = [body_sorted[0]]
+    for c in body_sorted[1:]:
+        if abs(c[1] - grupo_atual[-1][1]) <= TOLERANCIA_Y:
+            grupo_atual.append(c)
+        else:
+            grupos.append(grupo_atual)
+            grupo_atual = [c]
+    grupos.append(grupo_atual)
+
+    # ── Passo 3: limpar cada grupo — 1 círculo por coluna (maior raio) ──
+    linhas_limpas: list[dict] = []
+    for grupo in grupos:
+        colunas: dict[int, any] = {}
+        for c in grupo:
+            ci = col_idx(int(c[0]))
+            if ci not in colunas or c[2] > colunas[ci][2]:
+                colunas[ci] = c
+        if len(colunas) >= max(2, n_alternativas - 2):  # linha válida com pelo menos 3 bolhas
+            linhas_limpas.append(colunas)
+
+    if not linhas_limpas:
+        raise ValueError("Não foi possível identificar linhas de questões.")
+
+    # Limitar ao número de questões solicitado
+    linhas_limpas = linhas_limpas[:num_questoes]
+
+    # ── Passo 4: calcular densidades e determinar resposta ──
     mask = criar_mascara_azul(tabela)
     LETRAS = ["A", "B", "C", "D", "E"]
 
-    dados: dict[int, dict[int, float]] = {}
-    for c in body:
-        cx, cy, r = int(c[0]), int(c[1]), int(c[2])
-        ri = nearest(cy, row_centers)
-        ci = nearest(cx, col_centers)
-        d = densidade_bolha(mask, cx, cy, r)
-        dados.setdefault(ri, {})
-        dados[ri][ci] = max(dados[ri].get(ci, 0), d)
-
     answers: dict[str, str] = {}
-    for ri in sorted(dados.keys()):
-        opcoes = dados[ri]
-        melhor = max(opcoes, key=opcoes.get)
-        answers[str(ri + 1)] = LETRAS[melhor] if melhor < len(LETRAS) else "?"
+    for i, linha in enumerate(linhas_limpas):
+        densidades = {
+            ci: densidade_bolha(mask, int(c[0]), int(c[1]), int(c[2]))
+            for ci, c in linha.items()
+        }
+        melhor = max(densidades, key=densidades.get)
+        answers[str(i + 1)] = LETRAS[melhor] if melhor < len(LETRAS) else "?"
 
     return {"total": len(answers), "answers": answers}
 
@@ -260,14 +282,12 @@ async def ler_gabarito(
 
     Tempo máximo de processamento: **10 segundos**.
     """
-    # Validar content-type
     if file.content_type not in ("image/jpeg", "image/png", "image/jpg"):
         raise HTTPException(
             status_code=422,
             detail="Formato inválido. Envie uma imagem JPG ou PNG.",
         )
 
-    # Ler bytes e validar tamanho
     contents = await file.read()
     size_mb = len(contents) / (1024 * 1024)
     if size_mb > MAX_IMAGE_SIZE_MB:
@@ -276,14 +296,12 @@ async def ler_gabarito(
             detail=f"Imagem muito grande ({size_mb:.1f} MB). Limite: {MAX_IMAGE_SIZE_MB} MB.",
         )
 
-    # Decodificar imagem
     nparr = np.frombuffer(contents, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(status_code=422, detail="Não foi possível decodificar a imagem.")
 
-    # Executar processamento em thread separada com timeout
-    # (OpenCV/KMeans são bloqueantes — rodar no executor evita travar o event loop)
+    # Executar em thread separada com timeout (OpenCV/KMeans são bloqueantes)
     loop = asyncio.get_event_loop()
     fn = partial(processar_gabarito, img, num_questoes, num_alternativas)
 
@@ -313,7 +331,6 @@ async def ler_gabarito(
 
 @app.get("/docs", include_in_schema=False)
 def swagger_ui() -> HTMLResponse:
-    """Swagger UI com Try it out habilitado e campo de busca."""
     return get_swagger_ui_html(
         openapi_url="/openapi.json",
         title="Leitor de Gabarito — Swagger UI",
@@ -331,7 +348,6 @@ def swagger_ui() -> HTMLResponse:
 
 @app.get("/redoc", include_in_schema=False)
 def redoc_ui() -> HTMLResponse:
-    """ReDoc — documentação legível e navegável."""
     return get_redoc_html(
         openapi_url="/openapi.json",
         title="Leitor de Gabarito — ReDoc",
@@ -342,7 +358,6 @@ def redoc_ui() -> HTMLResponse:
 
 @app.get("/openapi.json", include_in_schema=False)
 def openapi_schema():
-    """Schema OpenAPI 3.0 em JSON."""
     return get_openapi(
         title=app.title,
         version=app.version,
