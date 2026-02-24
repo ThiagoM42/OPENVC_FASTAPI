@@ -1,375 +1,608 @@
-from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import JSONResponse
-import numpy as np
+"""
+main.py — Gabarito Reader API
+Arquivo único compatível com a stack Docker existente no Portainer.
+
+Endpoint principal:
+    POST /process   → recebe imagem, retorna respostas em JSON
+
+Recursos:
+    • Caneta azul e preta
+    • Correção automática de perspectiva e rotação (até ~20°)
+    • Detecção de múltiplas marcações
+    • Endpoint de debug com imagem anotada em base64
+
+Uso local:
+    uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+"""
+
+from __future__ import annotations
+
+import base64
+import logging
+from itertools import combinations
+
 import cv2
-import os
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-app = FastAPI()
+# ════════════════════════════════════════════════════════════════════════════════
+# Logging
+# ════════════════════════════════════════════════════════════════════════════════
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("gabarito_api")
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Configuração
+# ════════════════════════════════════════════════════════════════════════════════
+
+FILL_THRESHOLD       = 0.65   # dark_ratio mínimo para considerar bolha preenchida
+DARK_PIXEL           = 128    # limiar de pixel escuro
+TARGET_HEIGHT        = 1200   # altura de trabalho (px)
+OPTIONS              = ["A", "B", "C", "D", "E"]
+PERSP_SKEW_THRESHOLD = 2.5    # graus — abaixo disso perspectiva é ignorada
+ROTATE_THRESHOLD     = 0.5    # graus — abaixo disso não rotaciona
+MAX_FILE_SIZE        = 10 * 1024 * 1024  # 10 MB
+
+HOUGH_NORMAL    = dict(dp=1, minDist=22, param1=50, param2=17,
+                       minRadius=10, maxRadius=38)
+HOUGH_SENSITIVE = dict(dp=1, minDist=20, param1=40, param2=13,
+                       minRadius=9,  maxRadius=40)
+
+ALLOWED_TYPES = {
+    "image/jpeg", "image/jpg", "image/png",
+    "image/bmp", "image/webp", "image/tiff",
+}
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Alinhamento — correção de perspectiva e rotação
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _order_points(pts: np.ndarray) -> np.ndarray:
+    """Ordena 4 cantos: TL, TR, BR, BL."""
+    pts = pts.astype(np.float32)
+    s, diff = pts.sum(axis=1), np.diff(pts, axis=1).flatten()
+    return np.array(
+        [pts[np.argmin(s)], pts[np.argmin(diff)],
+         pts[np.argmax(s)], pts[np.argmax(diff)]],
+        dtype=np.float32,
+    )
 
 
-# ──────────────────────────── helpers ────────────────────────────
-
-def _decode_image(source) -> np.ndarray:
-    if isinstance(source, (bytes, bytearray)):
-        arr = np.frombuffer(source, dtype=np.uint8)
-        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if img is None:
-            raise ValueError("Não foi possível decodificar os bytes da imagem.")
-    else:
-        if not os.path.exists(source):
-            raise FileNotFoundError(f"Imagem não encontrada: {source}")
-        img = cv2.imread(str(source))
-        if img is None:
-            raise ValueError(f"Não foi possível carregar: {source}")
-    return img
+def _perspective_transform(img: np.ndarray, pts: np.ndarray) -> np.ndarray | None:
+    rect = _order_points(pts)
+    tl, tr, br, bl = rect
+    maxW = max(int(np.linalg.norm(br - bl)), int(np.linalg.norm(tr - tl)))
+    maxH = max(int(np.linalg.norm(tr - br)), int(np.linalg.norm(tl - bl)))
+    if maxW < 100 or maxH < 100:
+        return None
+    dst = np.array(
+        [[0, 0], [maxW - 1, 0], [maxW - 1, maxH - 1], [0, maxH - 1]],
+        dtype=np.float32,
+    )
+    M = cv2.getPerspectiveTransform(rect, dst)
+    return cv2.warpPerspective(img, M, (maxW, maxH), borderValue=(245, 245, 245))
 
 
-def _cluster(values: list, tol: int) -> list:
-    sv = sorted(values)
-    if not sv:
+def _is_significant_perspective(pts: np.ndarray) -> bool:
+    rect = _order_points(pts)
+    tl, tr, br, bl = rect
+    top_angle = abs(np.degrees(np.arctan2(tr[1] - tl[1], tr[0] - tl[0])))
+    bot_angle = abs(np.degrees(np.arctan2(br[1] - bl[1], br[0] - bl[0])))
+    lh, rh = np.linalg.norm(bl - tl), np.linalg.norm(br - tr)
+    tw, bw = np.linalg.norm(tr - tl), np.linalg.norm(br - bl)
+    h_ratio = abs(lh - rh) / max(lh, rh, 1)
+    w_ratio = abs(tw - bw) / max(tw, bw, 1)
+    return (max(top_angle, bot_angle) > PERSP_SKEW_THRESHOLD
+            or h_ratio > 0.03 or w_ratio > 0.03)
+
+
+def _find_document_corners(gray: np.ndarray) -> np.ndarray | None:
+    blurred   = cv2.GaussianBlur(gray, (7, 7), 0)
+    img_area  = gray.shape[0] * gray.shape[1]
+
+    for morph_k, morph_i, eps in [
+        (5, 2, 0.020), (3, 1, 0.025), (5, 3, 0.015), (7, 2, 0.030)
+    ]:
+        _, binary = cv2.threshold(
+            blurred, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+        )
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (morph_k, morph_k))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel,
+                                  iterations=morph_i)
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+            if cv2.contourArea(cnt) < img_area * 0.08:
+                continue
+            peri   = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, eps * peri, True)
+            if len(approx) == 4:
+                return approx.reshape(4, 2).astype(np.float32)
+    return None
+
+
+def _estimate_skew_lines(gray: np.ndarray) -> float | None:
+    edges = cv2.Canny(cv2.GaussianBlur(gray, (5, 5), 0), 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60,
+                             minLineLength=50, maxLineGap=30)
+    if lines is None:
+        return None
+    angles, weights = [], []
+    for x1, y1, x2, y2 in lines[:, 0]:
+        if abs(x2 - x1) < 1:
+            continue
+        angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        if -20 < angle < 20:
+            angles.append(angle)
+            weights.append(np.hypot(x2 - x1, y2 - y1))
+    return float(np.average(angles, weights=weights)) if angles else None
+
+
+def _estimate_skew_projection(gray: np.ndarray, steps: int = 81) -> float:
+    h, w = gray.shape
+    _, binary = cv2.threshold(gray, 0, 255,
+                              cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    best_angle, best_score = 0.0, -1.0
+    for angle in np.linspace(-20, 20, steps):
+        M   = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+        rot = cv2.warpAffine(binary, M, (w, h))
+        score = float(rot.sum(axis=1).astype(float).var())
+        if score > best_score:
+            best_score, best_angle = score, angle
+    return best_angle
+
+
+def _rotate_image(img: np.ndarray, angle: float) -> np.ndarray:
+    if abs(angle) < ROTATE_THRESHOLD:
+        return img
+    h, w = img.shape[:2]
+    M    = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+    cos_a, sin_a = abs(M[0, 0]), abs(M[0, 1])
+    new_w = int(h * sin_a + w * cos_a)
+    new_h = int(h * cos_a + w * sin_a)
+    M[0, 2] += (new_w - w) / 2
+    M[1, 2] += (new_h - h) / 2
+    return cv2.warpAffine(img, M, (new_w, new_h),
+                          flags=cv2.INTER_LINEAR,
+                          borderValue=(245, 245, 245))
+
+
+def align_image(img: np.ndarray) -> tuple[np.ndarray, str]:
+    """
+    Alinha a imagem em cascata:
+      1. Perspectiva (4 cantos detectados)
+      2. Rotação via HoughLinesP
+      3. Rotação via projeção de pixels (fallback robusto)
+
+    Retorna (img_alinhada, metodo_descricao).
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = img.shape[:2]
+
+    # ── Método 1: perspectiva ────────────────────────────────────────────
+    corners = _find_document_corners(gray)
+    if corners is not None:
+        area_ratio = cv2.contourArea(corners) / (h * w)
+        if area_ratio > 0.08 and _is_significant_perspective(corners):
+            warped = _perspective_transform(img, corners)
+            if warped is not None and warped.shape[0] > 200 and warped.shape[1] > 200:
+                return warped, f"perspectiva ({area_ratio:.0%})"
+
+    # ── Método 2: rotação via Hough ──────────────────────────────────────
+    angle_hough = _estimate_skew_lines(gray)
+    if angle_hough is not None and abs(angle_hough) > ROTATE_THRESHOLD:
+        return _rotate_image(img, angle_hough), f"rotação {angle_hough:+.1f}° (Hough)"
+
+    # ── Método 3: rotação via projeção ───────────────────────────────────
+    angle_proj = _estimate_skew_projection(gray)
+    if abs(angle_proj) > ROTATE_THRESHOLD:
+        return _rotate_image(img, angle_proj), f"rotação {angle_proj:+.1f}° (projeção)"
+
+    return img, "sem ajuste"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Análise de pixel — detecção de tinta
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _dark_ratio(gray: np.ndarray, cx: int, cy: int, r: int) -> float:
+    """Proporção de pixels escuros dentro do raio interno da bolha."""
+    mask = np.zeros(gray.shape, dtype=np.uint8)
+    cv2.circle(mask, (cx, cy), max(4, int(r * 0.75)), 255, -1)
+    pix = gray[mask > 0]
+    return float(np.sum(pix < DARK_PIXEL)) / len(pix) if len(pix) > 0 else 0.0
+
+
+def _classify_ink(img_bgr: np.ndarray, cx: int, cy: int, r: int) -> str:
+    """
+    Classifica a cor da tinta na bolha.
+    Retorna: 'blue' | 'black' | 'none'
+    """
+    mask = np.zeros(img_bgr.shape[:2], dtype=np.uint8)
+    cv2.circle(mask, (cx, cy), max(4, int(r * 0.75)), 255, -1)
+    pix = img_bgr[mask > 0].astype(float)
+    if len(pix) == 0:
+        return "none"
+    b, g, r_ch = pix[:, 0].mean(), pix[:, 1].mean(), pix[:, 2].mean()
+    brightness = (b + g + r_ch) / 3
+    if brightness > 160:
+        return "none"
+    # Caneta azul: canal B dominante
+    if b - max(g, r_ch) > 18:
+        return "blue"
+    # Caneta preta: todos os canais escuros e equilibrados
+    if brightness < 150 and (max(b, g, r_ch) - min(b, g, r_ch)) < 50:
+        return "black"
+    return "none"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Detecção de círculos (HoughCircles com dois níveis de sensibilidade)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _hough(gray: np.ndarray, params: dict) -> list:
+    blurred = cv2.medianBlur(gray, 5)
+    cs = cv2.HoughCircles(blurred, cv2.HOUGH_GRADIENT, **params)
+    if cs is None:
         return []
-    groups = [[sv[0]]]
-    for v in sv[1:]:
-        if v - groups[-1][-1] <= tol:
+    return [
+        (int(cx), int(cy), int(r), _dark_ratio(gray, int(cx), int(cy), int(r)))
+        for cx, cy, r in np.round(cs[0]).astype(int)
+    ]
+
+
+def find_circles(gray: np.ndarray) -> list:
+    """
+    Detecta círculos em dois níveis de sensibilidade.
+    Se o nível normal encontrar menos de 20, combina com o sensível.
+    """
+    circles = _hough(gray, HOUGH_NORMAL)
+    if len(circles) < 20:
+        for c in _hough(gray, HOUGH_SENSITIVE):
+            cx, cy, r, d = c
+            if not any(abs(cx - e[0]) < 15 and abs(cy - e[1]) < 15
+                       for e in circles):
+                circles.append(c)
+    return circles
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Inferência da grade (colunas A-E e linhas de questões)
+# ════════════════════════════════════════════════════════════════════════════════
+
+def _cluster_1d(vals: list, gap: int = 18) -> list[tuple[int, int]]:
+    """
+    Agrupa valores por proximidade (preserva multiplicidade).
+    Retorna [(centro, contagem), ...].
+    """
+    vals = sorted(int(v) for v in vals)
+    if not vals:
+        return []
+    groups = [[vals[0]]]
+    for v in vals[1:]:
+        if v - groups[-1][-1] <= gap:
             groups[-1].append(v)
         else:
             groups.append([v])
-    return [int(np.mean(g)) for g in groups]
+    return [(int(np.mean(g)), len(g)) for g in groups]
 
 
-def _is_blue_pen(img: np.ndarray, x_min: int) -> bool:
-    """Detecta se a marcação foi feita com caneta azul/roxa."""
-    b    = img[:, :, 0].astype(np.int16)
-    r_ch = img[:, :, 2].astype(np.int16)
-    diff = np.clip(b - r_ch, 0, 255)
-    region = diff[:, x_min:]
-    pct = float(np.sum(region > 50)) / region.size
-    return pct > 0.005
+def _infer_option_columns(circles: list, n: int = 5) -> list[int]:
+    """Seleciona as n colunas X das opções com espaçamento mais uniforme."""
+    xs = _cluster_1d([cx for cx, cy, r, d in circles], gap=18)
+    frequent = [(c, cnt) for c, cnt in xs if cnt >= 4]
+    if not frequent:
+        frequent = sorted(xs, key=lambda x: x[1], reverse=True)[:n + 2]
+
+    centers = sorted(c for c, _ in frequent)
+    if len(centers) == n:
+        return centers
+
+    best, best_score = None, float("inf")
+    for combo in combinations(centers, n):
+        combo = sorted(combo)
+        if combo[-1] - combo[0] < 80:
+            continue
+        score = float(np.std([combo[i + 1] - combo[i] for i in range(n - 1)]))
+        if score < best_score:
+            best_score, best = score, list(combo)
+    return best or centers[:n]
 
 
-def _adaptive_dark_threshold(gray: np.ndarray, x_min: int) -> int:
+def _infer_question_rows(circles: list) -> list[int]:
     """
-    Calcula threshold adaptativo para dark_fill via Otsu.
-    Funciona tanto para caneta preta quanto para lápis (cinza médio).
+    Retorna os Y centrais das linhas de questões.
+    Filtra cabeçalho e ruído via consistência do espaçamento.
     """
-    region = gray[:, x_min:]
-    otsu_val, _ = cv2.threshold(region, 0, 255,
-                                cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    dark_pixels = region[region < int(otsu_val)]
-    if len(dark_pixels) > 100:
-        # 90º percentil dos pixels escuros captura tanto lápis (100-130)
-        # quanto caneta preta (40-80)
-        return int(np.percentile(dark_pixels, 90))
-    return 120  # fallback seguro
+    ys_all     = _cluster_1d([cy for cx, cy, r, d in circles], gap=18)
+    candidates = sorted(yc for yc, cnt in ys_all if cnt >= 3)
+    if len(candidates) <= 3:
+        return candidates
+
+    spacings  = [candidates[i + 1] - candidates[i]
+                 for i in range(len(candidates) - 1)]
+    median_sp = float(np.median(spacings))
+    tol       = median_sp * 0.40
+
+    best_start, best_len = 0, 1
+    cur_start,  cur_len  = 0, 1
+    for i, sp in enumerate(spacings):
+        if abs(sp - median_sp) <= tol:
+            cur_len += 1
+            if cur_len > best_len:
+                best_len, best_start = cur_len, cur_start
+        else:
+            cur_start, cur_len = i + 1, 1
+
+    return candidates[best_start: best_start + best_len]
 
 
-def _br_fill(img: np.ndarray, cx: int, cy: int, r: int,
-             threshold: int = 50) -> float:
-    """Fill de pixels onde B-R > threshold (caneta azul/roxa)."""
-    inner = max(int(r * 0.55), 3)
-    mask = np.zeros(img.shape[:2], dtype=np.uint8)
-    cv2.circle(mask, (int(cx), int(cy)), inner, 255, -1)
-    area = float(np.sum(mask > 0))
-    if area == 0:
-        return 0.0
-    b    = img[:, :, 0].astype(np.int16)
-    r_ch = img[:, :, 2].astype(np.int16)
-    diff = np.clip(b - r_ch, 0, 255).astype(np.uint8)
-    return float(np.sum((diff > threshold) & (mask > 0))) / area
+# ════════════════════════════════════════════════════════════════════════════════
+# Pipeline principal de leitura
+# ════════════════════════════════════════════════════════════════════════════════
 
-
-def _dark_fill(gray: np.ndarray, cx: int, cy: int, r: int,
-               threshold: int = 120) -> float:
-    """Fill de pixels escuros (caneta preta ou lápis)."""
-    inner = max(int(r * 0.55), 3)
-    mask = np.zeros(gray.shape, dtype=np.uint8)
-    cv2.circle(mask, (int(cx), int(cy)), inner, 255, -1)
-    area = float(np.sum(mask > 0))
-    if area == 0:
-        return 0.0
-    return float(np.sum((gray < threshold) & (mask > 0))) / area
-
-
-def _detect_answers(fills: list,
-                    fill_min: float = 0.05,
-                    relative_factor: float = 2.0) -> list:
+def read_gabarito(image_bytes: bytes, debug: bool = False) -> dict:
     """
-    Detecta quais alternativas estão marcadas em uma linha.
-
-    Retorna lista de índices (pode ter 0, 1 ou mais elementos).
-    Suporta múltiplas marcações: todas as colunas com fill >= 45%
-    do melhor fill são consideradas marcadas.
-    """
-    if not fills:
-        return []
-    best = max(fills)
-    if best < fill_min:
-        return []
-    # O melhor deve se destacar dos outros
-    best_idx = int(np.argmax(fills))
-    others   = [f for i, f in enumerate(fills) if i != best_idx]
-    avg_o    = float(np.mean(others)) if others else 0.0
-    if avg_o > 0 and best < avg_o * relative_factor:
-        return []
-    # Inclui todas as alternativas com >= 45% do melhor
-    multi_thresh = max(fill_min, best * 0.45)
-    return [i for i, f in enumerate(fills) if f >= multi_thresh]
-
-
-def _find_marked_br(img: np.ndarray, x_min: int, h: int) -> list:
-    """Detecta centros de círculos marcados com caneta azul (B-R > 150)."""
-    b    = img[:, :, 0].astype(np.int16)
-    r_ch = img[:, :, 2].astype(np.int16)
-    diff = np.clip(b - r_ch, 0, 255).astype(np.uint8)
-    mask = (diff > 150).astype(np.uint8) * 255
-    mask = cv2.dilate(mask, np.ones((5, 5), np.uint8), iterations=2)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    min_area = max(100, int((h * 0.012) ** 2 * 0.3))
-    centers = []
-    for cnt in contours:
-        if cv2.contourArea(cnt) < min_area:
-            continue
-        M = cv2.moments(cnt)
-        if M['m00'] == 0:
-            continue
-        cx = int(M['m10'] / M['m00'])
-        cy = int(M['m01'] / M['m00'])
-        if cx < x_min:
-            continue
-        r_est = max(int(np.sqrt(cv2.contourArea(cnt) / np.pi)), 5)
-        centers.append((cx, cy, r_est))
-    return centers
-
-
-def _regularize_cols(raw_cols: list, n: int = 5) -> list:
-    """Ajusta n colunas regularmente espaçadas ao conjunto detectado."""
-    if len(raw_cols) < 2:
-        return raw_cols
-    best_score, best_result = -1, raw_cols[:n]
-    for i in range(len(raw_cols)):
-        for j in range(i + 1, len(raw_cols)):
-            for idx_i in range(n):
-                for idx_j in range(idx_i + 1, n):
-                    if idx_j - idx_i != (j - i):
-                        continue
-                    spacing = (raw_cols[j] - raw_cols[i]) / (idx_j - idx_i)
-                    if not (20 <= spacing <= 400):
-                        continue
-                    start  = raw_cols[i] - idx_i * spacing
-                    grid   = [start + k * spacing for k in range(n)]
-                    score  = sum(1 for c in raw_cols
-                                 if min(abs(c - g) for g in grid) < spacing * 0.3)
-                    if score > best_score:
-                        best_score = score
-                        best_result = [int(round(g)) for g in grid]
-    return best_result
-
-
-def _infer_cols_from_marked(marked_xs: list, x_min: int,
-                             w: int, n: int = 5) -> list:
-    """Infere n colunas uniformes a partir dos X dos círculos marcados."""
-    col_m = _cluster(marked_xs, tol=int(w * 0.05))
-    if len(col_m) < 2:
-        return []
-    spacings    = [col_m[i+1] - col_m[i] for i in range(len(col_m) - 1)]
-    col_spacing = int(np.median(spacings))
-    best_cols, best_score = None, -1
-    for si in range(n):
-        start = min(col_m) - si * col_spacing
-        cols  = [start + k * col_spacing for k in range(n)]
-        if not all(x_min * 0.3 < c < w * 0.98 for c in cols):
-            continue
-        score = sum(1 for mx in marked_xs
-                    if min(abs(mx - c) for c in cols) < col_spacing * 0.3)
-        if score > best_score:
-            best_score, best_cols = score, [int(c) for c in cols]
-    return best_cols or []
-
-
-def _find_circles_hough(gray: np.ndarray, h: int, w: int, x_min: int,
-                        num_options: int = 5, min_rows: int = 8):
-    """Busca adaptativa de círculos via HoughCircles (param2 50→15)."""
-    min_r    = max(5,  int(h * 0.010))
-    max_r    = max(15, int(h * 0.032))
-    min_dist = max(8,  int(min_r * 1.2))
-    best = None
-    for param2 in [50, 45, 40, 35, 30, 25, 20, 15]:
-        raw = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT,
-                               dp=1, minDist=min_dist,
-                               param1=50, param2=param2,
-                               minRadius=min_r, maxRadius=max_r)
-        if raw is None:
-            continue
-        circles = [(int(cx), int(cy), int(r))
-                   for cx, cy, r in np.round(raw[0]).astype(int)
-                   if cx > x_min]
-        if not circles:
-            continue
-        col_all = _cluster([cx for cx, cy, r in circles], tol=int(w * 0.020))
-        col_pop = {i: 0 for i in range(len(col_all))}
-        for cx, cy, r in circles:
-            ci = min(range(len(col_all)), key=lambda i: abs(cx - col_all[i]))
-            col_pop[ci] += 1
-        top_cols    = sorted(sorted(col_pop, key=col_pop.get, reverse=True)[:num_options])
-        col_centers = [col_all[i] for i in top_cols]
-        row_centers = _cluster([cy for cx, cy, r in circles], tol=int(h * 0.020))
-        best = (circles, row_centers, col_centers)
-        if len(col_centers) == num_options and len(row_centers) >= min_rows:
-            return best
-    return best
-
-
-# ──────────────────────────── core ────────────────────────────
-
-def read_gabarito(source, num_questions: int = None) -> list:
-    """
-    Lê um gabarito de múltipla escolha e retorna as respostas do aluno.
+    Processa os bytes de uma imagem e retorna o resultado do gabarito.
 
     Parâmetros
     ----------
-    source        : bytes (HTTP) ou str/Path com caminho do arquivo.
-    num_questions : número de questões esperadas; None = detecta automaticamente.
+    image_bytes : bytes brutos da imagem (JPEG, PNG, BMP, WebP…).
+    debug       : se True, inclui PNG anotado em base64 no retorno.
 
     Retorna
     -------
-    Lista de dicts:
-      [{"question_number": int,
-        "student_answer": str | list[str] | None}, ...]
+    dict com as chaves:
+      - alinhamento        : str — método aplicado
+      - total_questoes     : int
+      - total_respondidas  : int
+      - total_nao_resp     : int
+      - total_multiplas    : int
+      - questoes           : list[dict] com campos:
+            question_number  : int
+            student_answer   : str | list[str] | None
+            multipla_marcacao: bool
+            marcacoes        : list[str]
+      - debug_image        : str | None — PNG base64 (somente se debug=True)
 
-      - str       → resposta única, ex: "B"
-      - list[str] → múltiplas marcações, ex: ["B", "D"]
-      - None      → questão em branco
+    Raises
+    ------
+    ValueError : imagem inválida ou grade não detectada.
     """
-    NUM_OPTIONS      = 5
-    LEFT_MARGIN_FRAC = 0.25
-    FILL_MIN         = 0.05
-    RELATIVE_FACTOR  = 2.0
+    # ── Decodifica ────────────────────────────────────────────────────────
+    arr = np.frombuffer(image_bytes, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("Formato de imagem inválido ou arquivo corrompido.")
 
-    # ── 1. Carrega ────────────────────────────────────────────────────────
-    img  = _decode_image(source)
-    h, w = img.shape[:2]
+    # ── Redimensiona para altura padrão ───────────────────────────────────
+    scale = TARGET_HEIGHT / img.shape[0]
+    img   = cv2.resize(img, (int(img.shape[1] * scale), TARGET_HEIGHT))
+
+    # ── Alinha ────────────────────────────────────────────────────────────
+    img, align_method = align_image(img)
+
+    # Re-escala após alinhamento (perspectiva pode alterar dimensões)
+    scale2 = TARGET_HEIGHT / img.shape[0]
+    if abs(scale2 - 1.0) > 0.01:
+        img = cv2.resize(img, (int(img.shape[1] * scale2), TARGET_HEIGHT))
+
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    x_min = int(w * LEFT_MARGIN_FRAC)
 
-    # ── 2. Detecta tipo de marcação ───────────────────────────────────────
-    blue_pen       = _is_blue_pen(img, x_min)
-    dark_threshold = _adaptive_dark_threshold(gray, x_min)
+    # ── Detecta círculos e grade ──────────────────────────────────────────
+    circles = find_circles(gray)
+    if not circles:
+        raise ValueError("Nenhuma bolha detectada na imagem.")
 
-    # ── 3. HoughCircles para detectar o grid ──────────────────────────────
-    hough = _find_circles_hough(gray, h, w, x_min, num_options=NUM_OPTIONS)
-    if hough is None:
-        raise RuntimeError(
-            "Nenhum círculo detectado. Verifique a qualidade da imagem.")
+    option_xs   = _infer_option_columns(circles)
+    question_ys = _infer_question_rows(circles)
 
-    hough_circles, hough_rows, hough_cols = hough
-    avg_r = (int(np.mean([r for cx, cy, r in hough_circles]))
-             if hough_circles else int(h * 0.022))
+    if not option_xs or not question_ys:
+        raise ValueError("Não foi possível identificar a grade do gabarito.")
 
-    # ── 4. Refina colunas com marcados azuis (se caneta azul) ─────────────
-    col_centers = None
-    blue_marked = []
-    if blue_pen:
-        blue_marked = _find_marked_br(img, x_min, h)
-        if len(blue_marked) >= 2:
-            col_centers = _infer_cols_from_marked(
-                [m[0] for m in blue_marked], x_min, w, n=NUM_OPTIONS)
+    tol_x, tol_y = 25, 28
 
-    if not col_centers:
-        col_centers = _regularize_cols(hough_cols, n=NUM_OPTIONS) or hough_cols
+    # ── Classifica cada célula ────────────────────────────────────────────
+    questoes = []
+    for q_idx, qy in enumerate(question_ys, start=1):
+        marcacoes: list[str] = []
 
-    # ── 5. Combina linhas dos marcados azuis + HoughCircles ───────────────
-    all_rows = (set(_cluster([m[1] for m in blue_marked], tol=int(h * 0.025)))
-                if blue_marked else set())
-    for ry in hough_rows:
-        if not any(abs(ry - er) < avg_r * 1.5 for er in all_rows):
-            all_rows.add(ry)
-
-    # Complementa se ainda faltam linhas
-    if len(all_rows) < 8:
-        min_r = max(5, int(h * 0.010))
-        max_r = max(15, int(h * 0.032))
-        for p2 in range(20, 5, -5):
-            raw = cv2.HoughCircles(gray, cv2.HOUGH_GRADIENT, dp=1,
-                                   minDist=max(8, int(min_r * 1.2)),
-                                   param1=50, param2=p2,
-                                   minRadius=min_r, maxRadius=max_r)
-            if raw is None:
+        for opt_idx, ox in enumerate(option_xs):
+            candidates = [
+                (cx, cy, r, d) for cx, cy, r, d in circles
+                if abs(cx - ox) <= tol_x and abs(cy - qy) <= tol_y
+            ]
+            if not candidates:
                 continue
-            extra = [(int(cx), int(cy), int(r))
-                     for cx, cy, r in np.round(raw[0]).astype(int)
-                     if cx > x_min]
-            for ry in _cluster([cy for cx, cy, r in extra], tol=int(h * 0.020)):
-                if not any(abs(ry - er) < avg_r * 1.5 for er in all_rows):
-                    all_rows.add(ry)
-            if len(all_rows) >= 8:
-                break
 
-    row_centers = sorted(all_rows)
+            bx, by, br, bd = max(candidates, key=lambda c: c[3])
+            if bd >= FILL_THRESHOLD and _classify_ink(img, bx, by, br) in ("blue", "black"):
+                marcacoes.append(OPTIONS[opt_idx])
 
-    # ── 6. Remove cabeçalho ───────────────────────────────────────────────
-    if len(row_centers) > 1:
-        gaps       = [row_centers[i+1] - row_centers[i]
-                      for i in range(len(row_centers) - 1)]
-        median_gap = float(np.median(gaps))
-        header_idx = {i for i, g in enumerate(gaps) if g > median_gap * 1.5}
-    else:
-        header_idx = set()
+        multipla = len(marcacoes) > 1
+        resposta = marcacoes[0] if len(marcacoes) == 1 else None
 
-    question_rows = [ry for i, ry in enumerate(row_centers)
-                     if i not in header_idx]
-    if num_questions is not None:
-        question_rows = question_rows[:num_questions]
-
-    # ── 7. Classifica cada célula ─────────────────────────────────────────
-    options = ['A', 'B', 'C', 'D', 'E']
-    results = []
-
-    for q_num, ry in enumerate(question_rows, start=1):
-        if not col_centers:
-            results.append({"question_number": q_num, "student_answer": None})
-            continue
-
-        # Calcula fills com o sinal correto para o tipo de caneta
-        if blue_pen:
-            fills = [_br_fill(img, cx, ry, avg_r) for cx in col_centers]
-        else:
-            fills = [_dark_fill(gray, cx, ry, avg_r, dark_threshold)
-                     for cx in col_centers]
-
-        # Detecta quantas alternativas foram marcadas
-        marked_idx = _detect_answers(fills,
-                                     fill_min=FILL_MIN,
-                                     relative_factor=RELATIVE_FACTOR)
-
-        if not marked_idx:
-            answer = None
-        elif len(marked_idx) == 1:
-            answer = options[marked_idx[0]]
-        else:
-            answer = [options[i] for i in sorted(marked_idx)]
-
-        results.append({
-            "question_number": q_num,
-            "student_answer":  answer
+        questoes.append({
+            "question_number":   q_idx,
+            "student_answer":    marcacoes if multipla else resposta,
+            "multipla_marcacao": multipla,
+            "marcacoes":         marcacoes,
         })
 
-    return results
+        if q_idx >= 25:
+            break
+
+    # Remove questões em branco do final
+    while questoes and not questoes[-1]["marcacoes"]:
+        questoes.pop()
+
+    total_resp     = sum(1 for q in questoes if len(q["marcacoes"]) == 1)
+    total_nao_resp = sum(1 for q in questoes if not q["marcacoes"])
+    total_mult     = sum(1 for q in questoes if q["multipla_marcacao"])
+
+    # ── Debug image (opcional) ────────────────────────────────────────────
+    debug_b64 = None
+    if debug:
+        dbg = img.copy()
+        for i, x in enumerate(option_xs):
+            cv2.line(dbg, (x, 0), (x, dbg.shape[0]), (0, 220, 220), 1)
+            cv2.putText(dbg, OPTIONS[i], (x - 10, 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 140, 200), 2)
+        for i, y in enumerate(question_ys):
+            cv2.line(dbg, (0, y), (dbg.shape[1], y), (0, 200, 100), 1)
+            cv2.putText(dbg, f"Q{i+1}", (5, y - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 160, 80), 1)
+        for cx, cy, r, dr in circles:
+            ink    = _classify_ink(dbg, cx, cy, r)
+            filled = dr >= FILL_THRESHOLD and ink in ("blue", "black")
+            color  = (0, 0, 220) if filled else (60, 180, 60)
+            cv2.circle(dbg, (cx, cy), r, color, 3 if filled else 1)
+            cv2.putText(dbg, f"{dr:.2f}", (cx - 14, cy + r + 13),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.28, color, 1)
+        ok, buf = cv2.imencode(".png", dbg)
+        if ok:
+            debug_b64 = base64.b64encode(buf.tobytes()).decode()
+
+    logger.info(
+        "Alinhamento: %s | %d questão(ões) | %d respondida(s)",
+        align_method, len(questoes), total_resp,
+    )
+
+    return {
+        "alinhamento":       align_method,
+        "total_questoes":    len(questoes),
+        "total_respondidas": total_resp,
+        "total_nao_resp":    total_nao_resp,
+        "total_multiplas":   total_mult,
+        "questoes":          questoes,
+        **({"debug_image": debug_b64} if debug_b64 else {}),
+    }
 
 
-# ──────────────────────────── endpoints ────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════════
+# FastAPI
+# ════════════════════════════════════════════════════════════════════════════════
 
-@app.get("/")
+app = FastAPI(
+    title="Gabarito Reader API",
+    description=(
+        "Leitura automática de gabaritos de múltipla escolha.\n\n"
+        "• Caneta azul e preta\n"
+        "• Correção de perspectiva e rotação\n"
+        "• Múltiplas marcações detectadas\n"
+    ),
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
+
+
+# ── Healthcheck ───────────────────────────────────────────────────────────────
+
+@app.get("/", summary="Healthcheck")
 def health():
-    return {"status": "OpenCV API running 🚀"}
+    """Verifica se a API está operacional."""
+    return {"status": "Gabarito API running 🚀", "version": "2.0.0"}
 
 
-@app.post("/process")
-async def process_image(file: UploadFile = File(...)):
+# ── Endpoint principal ────────────────────────────────────────────────────────
+
+@app.post("/process", summary="Analisa gabarito")
+async def process_image(
+    file: UploadFile = File(..., description="Imagem do gabarito (JPEG, PNG, BMP, WebP)"),
+):
+    """
+    Recebe uma imagem de gabarito e retorna as respostas detectadas.
+
+    Resposta:
+    ```json
+    {
+      "alinhamento": "perspectiva (68%)",
+      "total_questoes": 10,
+      "total_respondidas": 9,
+      "total_nao_resp": 1,
+      "total_multiplas": 0,
+      "questoes": [
+        {
+          "question_number": 1,
+          "student_answer": "B",
+          "multipla_marcacao": false,
+          "marcacoes": ["B"]
+        }
+      ]
+    }
+    ```
+    """
+    # Valida content-type
+    content_type = (file.content_type or "").lower().split(";")[0].strip()
+    if content_type not in ALLOWED_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Tipo não suportado: '{content_type}'. Use JPEG, PNG, BMP ou WebP.",
+        )
+
     contents = await file.read()
-    try:
-        answers = read_gabarito(contents)
-    except Exception as e:
-        print(f"Erro: {e}")
-        return {"error": str(e)}
 
-    return JSONResponse(content=answers)
+    # Valida tamanho
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Arquivo vazio.")
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Arquivo muito grande ({len(contents)/1024/1024:.1f} MB). Máximo: 10 MB.",
+        )
+
+    try:
+        result = read_gabarito(contents, debug=False)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Erro inesperado: %s", e)
+        raise HTTPException(status_code=500, detail="Erro interno ao processar a imagem.")
+
+    return JSONResponse(content=result)
+
+
+# ── Endpoint de debug ─────────────────────────────────────────────────────────
+
+@app.post("/process/debug", summary="Analisa gabarito com imagem de debug")
+async def process_image_debug(
+    file: UploadFile = File(..., description="Imagem do gabarito"),
+):
+    """
+    Igual a `POST /process`, mas inclui o campo `debug_image`:
+    um **PNG em base64** com os círculos e a grade anotados.
+
+    Para exibir a imagem de debug no frontend:
+    ```html
+    <img src="data:image/png;base64,{{ debug_image }}" />
+    ```
+    """
+    content_type = (file.content_type or "").lower().split(";")[0].strip()
+    if content_type not in ALLOWED_TYPES:
+        raise HTTPException(status_code=415, detail=f"Tipo não suportado: '{content_type}'.")
+
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=400, detail="Arquivo vazio.")
+
+    try:
+        result = read_gabarito(contents, debug=True)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("Erro inesperado: %s", e)
+        raise HTTPException(status_code=500, detail="Erro interno ao processar a imagem.")
+
+    return JSONResponse(content=result)
