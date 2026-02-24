@@ -17,6 +17,8 @@ PROCESSING_TIMEOUT_SECONDS = 10
 MAX_IMAGE_SIZE_MB = 10
 TARGET_WIDTH = 1201
 TARGET_HEIGHT = 1600
+DENSIDADE_MINIMA_AZUL  = 0.05   # caneta azul: gap claro entre 0.00 e 0.33
+DENSIDADE_MINIMA_PRETA = 0.15   # lápis/caneta preta: threshold maior devido ao ruído das bordas
 
 # ─────────────────────────────────────────────
 # DOCS
@@ -119,26 +121,41 @@ def recortar_tabela(img: np.ndarray) -> np.ndarray:
 def detectar_circulos(tabela: np.ndarray) -> np.ndarray | None:
     """Detecta todos os círculos (bolhas) via HoughCircles."""
     cinza = cv2.cvtColor(tabela, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(cinza, (5, 5), 0)
+    blur = cv2.GaussianBlur(cinza, (7, 7), 2)
     circles = cv2.HoughCircles(
         blur,
         cv2.HOUGH_GRADIENT,
         dp=1.2,
-        minDist=60,
+        minDist=80,
         param1=50,
-        param2=28,
+        param2=35,
         minRadius=25,
-        maxRadius=65,
+        maxRadius=80,
     )
     if circles is None:
         return None
     return np.round(circles[0]).astype("int")
 
 
-def criar_mascara_azul(tabela: np.ndarray) -> np.ndarray:
-    """Máscara HSV que isola a tinta azul de caneta."""
+def criar_mascara_tinta(tabela: np.ndarray) -> tuple[np.ndarray, float]:
+    """
+    Detecta automaticamente o tipo de tinta (azul ou preta/lápis)
+    e retorna a máscara binária + o threshold de densidade adequado.
+    """
     hsv = cv2.cvtColor(tabela, cv2.COLOR_BGR2HSV)
-    return cv2.inRange(hsv, np.array([100, 80, 50]), np.array([140, 255, 255]))
+    mask_azul = cv2.inRange(hsv, np.array([100, 80, 50]), np.array([140, 255, 255]))
+
+    cinza = cv2.cvtColor(tabela, cv2.COLOR_BGR2GRAY)
+    _, mask_preta = cv2.threshold(cinza, 100, 255, cv2.THRESH_BINARY_INV)
+    mask_preta = cv2.morphologyEx(
+        mask_preta, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    )
+
+    # Se houver pixels azuis suficientes, usa máscara azul; caso contrário, preta
+    if cv2.countNonZero(mask_azul) > cv2.countNonZero(mask_preta) * 0.1:
+        return mask_azul, DENSIDADE_MINIMA_AZUL
+    return mask_preta, DENSIDADE_MINIMA_PRETA
 
 
 def densidade_bolha(mask: np.ndarray, cx: int, cy: int, r: int) -> float:
@@ -219,13 +236,8 @@ def processar_gabarito(img: np.ndarray, num_questoes: int, n_alternativas: int) 
     linhas_limpas = linhas_limpas[:num_questoes]
 
     # ── Passo 4: calcular densidades e determinar resposta ──
-    mask = criar_mascara_azul(tabela)
+    mask, DENSIDADE_MINIMA = criar_mascara_tinta(tabela)
     LETRAS = ["A", "B", "C", "D", "E"]
-
-    # Densidade mínima para considerar uma bolha como marcada.
-    # Bolhas vazias ficam em 0.000; bolhas preenchidas ficam acima de 0.30.
-    # Threshold de 0.05 garante margem segura contra ruído de iluminação.
-    DENSIDADE_MINIMA = 0.05
 
     answers: dict[str, str | None] = {}
     for i, linha in enumerate(linhas_limpas):
