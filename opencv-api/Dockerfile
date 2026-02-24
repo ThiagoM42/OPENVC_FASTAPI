@@ -17,7 +17,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copia o código
-COPY app/ ./app/
+COPY main.py .
 
 # Usuário não-root (boa prática de segurança)
 RUN useradd -m apiuser
