@@ -53,11 +53,13 @@ API para leitura automática de gabaritos de múltipla escolha via visão comput
     "1": "B",
     "2": "C",
     "3": "D",
-    "4": "A",
+    "4": null,
     "5": "E"
   }
 }
 ```
+
+> Questões sem nenhuma bolha marcada retornam `null`.
 
 ### Limites
 
@@ -220,14 +222,25 @@ def processar_gabarito(img: np.ndarray, num_questoes: int, n_alternativas: int) 
     mask = criar_mascara_azul(tabela)
     LETRAS = ["A", "B", "C", "D", "E"]
 
-    answers: dict[str, str] = {}
+    # Densidade mínima para considerar uma bolha como marcada.
+    # Bolhas vazias ficam em 0.000; bolhas preenchidas ficam acima de 0.30.
+    # Threshold de 0.05 garante margem segura contra ruído de iluminação.
+    DENSIDADE_MINIMA = 0.05
+
+    answers: dict[str, str | None] = {}
     for i, linha in enumerate(linhas_limpas):
         densidades = {
             ci: densidade_bolha(mask, int(c[0]), int(c[1]), int(c[2]))
             for ci, c in linha.items()
         }
-        melhor = max(densidades, key=densidades.get)
-        answers[str(i + 1)] = LETRAS[melhor] if melhor < len(LETRAS) else "?"
+        melhor_col = max(densidades, key=densidades.get)
+        melhor_dens = densidades[melhor_col]
+
+        # Se nenhuma bolha atingiu o threshold, a questão está em branco
+        if melhor_dens < DENSIDADE_MINIMA:
+            answers[str(i + 1)] = None
+        else:
+            answers[str(i + 1)] = LETRAS[melhor_col] if melhor_col < len(LETRAS) else None
 
     return {"total": len(answers), "answers": answers}
 
@@ -264,7 +277,7 @@ def health():
                 "application/json": {
                     "example": {
                         "total": 5,
-                        "answers": {"1": "B", "2": "C", "3": "D", "4": "A", "5": "E"},
+                        "answers": {"1": "B", "2": "C", "3": "D", "4": None, "5": "E"},
                     }
                 }
             },
