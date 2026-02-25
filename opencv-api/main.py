@@ -128,7 +128,7 @@ def detectar_circulos(tabela: np.ndarray) -> np.ndarray | None:
         dp=1.2,
         minDist=80,
         param1=50,
-        param2=35,
+        param2=22,   # valor baixo para garantir detecção mesmo em imagens com baixo contraste
         minRadius=25,
         maxRadius=80,
     )
@@ -199,48 +199,40 @@ def processar_gabarito(img: np.ndarray, num_questoes: int, n_alternativas: int) 
     def col_idx(cx: int) -> int:
         return int(np.argmin([abs(cx - c) for c in col_centers]))
 
-    # ── Passo 2: agrupar linhas por proximidade de Y ──
-    # Tolerância dinâmica: 1.2× raio médio das bolhas detectadas
-    # Isso adapta automaticamente ao tamanho das bolhas em cada imagem,
-    # evitando que linhas próximas se fundam ou linhas distantes se separem.
-    r_medio = float(np.median([c[2] for c in body]))
-    TOLERANCIA_Y = int(r_medio * 1.2)
+    # ── Passo 2: detectar linhas via KMeans no eixo Y ──
+    # Usar KMeans com num_questoes clusters é mais robusto que agrupamento por
+    # tolerância fixa, pois funciona mesmo quando o raio da bolha é maior que
+    # o espaçamento entre linhas (gabaritos compactos / fotos de perto).
+    ys_arr = np.array([c[1] for c in body]).reshape(-1, 1)
+    row_centers = sorted(
+        KMeans(n_clusters=num_questoes, random_state=0, n_init=20)
+        .fit(ys_arr)
+        .cluster_centers_.flatten()
+    )
 
-    body_sorted = sorted(body, key=lambda c: c[1])
+    def nearest_row(cy: int) -> int:
+        return int(np.argmin([abs(cy - r) for r in row_centers]))
 
-    grupos: list[list] = []
-    grupo_atual = [body_sorted[0]]
-    for c in body_sorted[1:]:
-        if abs(c[1] - grupo_atual[-1][1]) <= TOLERANCIA_Y:
-            grupo_atual.append(c)
-        else:
-            grupos.append(grupo_atual)
-            grupo_atual = [c]
-    grupos.append(grupo_atual)
+    # ── Passo 3: montar grid — 1 círculo por (linha, coluna), maior raio vence ──
+    grid: dict[int, dict[int, any]] = {}
+    for c in body:
+        cx, cy, r = int(c[0]), int(c[1]), int(c[2])
+        ri = nearest_row(cy)
+        ci = col_idx(cx)
+        grid.setdefault(ri, {})
+        if ci not in grid[ri] or c[2] > grid[ri][ci][2]:
+            grid[ri][ci] = c
 
-    # ── Passo 3: limpar cada grupo — 1 círculo por coluna (maior raio) ──
-    linhas_limpas: list[dict] = []
-    for grupo in grupos:
-        colunas: dict[int, any] = {}
-        for c in grupo:
-            ci = col_idx(int(c[0]))
-            if ci not in colunas or c[2] > colunas[ci][2]:
-                colunas[ci] = c
-        if len(colunas) >= max(2, n_alternativas - 2):  # linha válida com pelo menos 3 bolhas
-            linhas_limpas.append(colunas)
-
-    if not linhas_limpas:
+    if not grid:
         raise ValueError("Não foi possível identificar linhas de questões.")
-
-    # Limitar ao número de questões solicitado
-    linhas_limpas = linhas_limpas[:num_questoes]
 
     # ── Passo 4: calcular densidades e determinar resposta ──
     mask, DENSIDADE_MINIMA = criar_mascara_tinta(tabela)
     LETRAS = ["A", "B", "C", "D", "E"]
 
     answers: dict[str, str | None] = {}
-    for i, linha in enumerate(linhas_limpas):
+    for ri in sorted(grid.keys()):
+        linha = grid[ri]
         densidades = {
             ci: densidade_bolha(mask, int(c[0]), int(c[1]), int(c[2]))
             for ci, c in linha.items()
@@ -250,9 +242,9 @@ def processar_gabarito(img: np.ndarray, num_questoes: int, n_alternativas: int) 
 
         # Se nenhuma bolha atingiu o threshold, a questão está em branco
         if melhor_dens < DENSIDADE_MINIMA:
-            answers[str(i + 1)] = None
+            answers[str(ri + 1)] = None
         else:
-            answers[str(i + 1)] = LETRAS[melhor_col] if melhor_col < len(LETRAS) else None
+            answers[str(ri + 1)] = LETRAS[melhor_col] if melhor_col < len(LETRAS) else None
 
     return {
         "total": len(answers),
