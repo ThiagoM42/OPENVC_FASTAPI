@@ -363,7 +363,31 @@ async def ler_gabarito(
 
     return JSONResponse(content=resultado)
 
+@app.post("/gabarito/compressImage", tags=["compressImage"], summary="Comprimir imagem")
+async def compress_image(
+    file: UploadFile = File(..., description="Foto do gabarito preenchido (JPG ou PNG)"),
+):
+    """
+    Endpoint auxiliar para comprimir imagens grandes antes de enviá-las para leitura.
+    Retorna a imagem comprimida em base64.
+    """
+    if file.content_type not in ("image/jpeg", "image/png", "image/jpg"):
+        raise HTTPException(
+            status_code=422,
+            detail="Formato inválido. Envie uma imagem JPG ou PNG.",
+        )
 
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=422, detail="Não foi possível decodificar a imagem.")
+
+    # Comprimir imagem para reduzir tamanho (ajustar qualidade conforme necessário)
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]  # qualidade entre 0-100
+    _, compressed = cv2.imencode('.jpg', img, encode_param)
+
+    return JSONResponse(content={"compressed_image": compressed.tobytes().hex()})
 # ─────────────────────────────────────────────
 # DOCS CUSTOMIZADAS
 # ─────────────────────────────────────────────
