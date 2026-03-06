@@ -1,5 +1,5 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Query
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, Response
 from fastapi.openapi.docs import get_swagger_ui_html, get_redoc_html
 from fastapi.openapi.utils import get_openapi
 import cv2
@@ -369,7 +369,7 @@ async def compress_image(
 ):
     """
     Endpoint auxiliar para comprimir imagens grandes antes de enviá-las para leitura.
-    Retorna a imagem comprimida em base64.
+    Retorna o arquivo JPEG comprimido.
     """
     if file.content_type not in ("image/jpeg", "image/png", "image/jpg"):
         raise HTTPException(
@@ -385,9 +385,19 @@ async def compress_image(
 
     # Comprimir imagem para reduzir tamanho (ajustar qualidade conforme necessário)
     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 70]  # qualidade entre 0-100
-    _, compressed = cv2.imencode('.jpg', img, encode_param)
+    ok, compressed = cv2.imencode('.jpg', img, encode_param)
+    if not ok:
+        raise HTTPException(status_code=500, detail="Falha ao comprimir a imagem.")
 
-    return JSONResponse(content={"compressed_image": compressed.tobytes().hex()})
+    compressed_bytes = compressed.tobytes()
+    original_name = (file.filename or "imagem").rsplit(".", 1)[0]
+    output_name = f"{original_name}_compressed.jpg"
+
+    return Response(
+        content=compressed_bytes,
+        media_type="image/jpeg",
+        headers={"Content-Disposition": f'attachment; filename="{output_name}"'},
+    )
 # ─────────────────────────────────────────────
 # DOCS CUSTOMIZADAS
 # ─────────────────────────────────────────────
